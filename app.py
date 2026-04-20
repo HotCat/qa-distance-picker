@@ -29,6 +29,13 @@ from processing import (
 )
 
 
+def _app_dir() -> str:
+    """Return the directory containing the app (source or frozen executable)."""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 # ════════════════════════════════════════════════════════════════════════
 #  Camera Settings Window
 # ════════════════════════════════════════════════════════════════════════
@@ -103,6 +110,15 @@ class CameraSettingsWindow(QWidget):
         gain_row.addWidget(self._gain_spin)
         layout.addRow("Analog Gain:", gain_row)
 
+        # Mirror checkboxes
+        self._reverse_x_check = QCheckBox("Reverse X (Horizontal Mirror)")
+        self._reverse_x_check.stateChanged.connect(self._on_setting_changed)
+        layout.addRow(self._reverse_x_check)
+
+        self._reverse_y_check = QCheckBox("Reverse Y (Vertical Mirror)")
+        self._reverse_y_check.stateChanged.connect(self._on_setting_changed)
+        layout.addRow(self._reverse_y_check)
+
     def set_ranges(self, ranges: CameraSettingRanges):
         """Configure slider/spinbox ranges from camera capability."""
         self._block_signals = True
@@ -132,6 +148,8 @@ class CameraSettingsWindow(QWidget):
         self._contrast_spin.setValue(settings.contrast)
         self._gain_slider.setValue(settings.analog_gain)
         self._gain_spin.setValue(settings.analog_gain)
+        self._reverse_x_check.setChecked(settings.reverse_x)
+        self._reverse_y_check.setChecked(settings.reverse_y)
         self._block_signals = False
 
     def _on_setting_changed(self):
@@ -148,6 +166,8 @@ class CameraSettingsWindow(QWidget):
             contrast=self._contrast_spin.value(),
             analog_gain=self._gain_spin.value(),
             ae_enabled=ae_on,
+            reverse_x=self._reverse_x_check.isChecked(),
+            reverse_y=self._reverse_y_check.isChecked(),
         )
         self.settings_changed.emit(settings)
 
@@ -521,7 +541,25 @@ class MainWindow(QMainWindow):
             super().keyPressEvent(event)
 
     def closeEvent(self, event):
-        """Clean up camera on window close."""
+        """Save camera settings to config, then clean up camera."""
+        # Save current settings from the settings window
+        cam_cfg = self._config.get('camera', {})
+        cam_cfg['exposure_us'] = self._settings_window._exposure_spin.value()
+        cam_cfg['gamma'] = self._settings_window._gamma_spin.value()
+        cam_cfg['contrast'] = self._settings_window._contrast_spin.value()
+        cam_cfg['analog_gain'] = self._settings_window._gain_spin.value()
+        cam_cfg['ae_enabled'] = self._settings_window._ae_check.isChecked()
+        cam_cfg['reverse_x'] = self._settings_window._reverse_x_check.isChecked()
+        cam_cfg['reverse_y'] = self._settings_window._reverse_y_check.isChecked()
+        self._config['camera'] = cam_cfg
+
+        config_path = os.path.join(_app_dir(), 'config.yaml')
+        try:
+            with open(config_path, 'w') as f:
+                yaml.dump(self._config, f, default_flow_style=False, sort_keys=False)
+        except Exception:
+            pass  # best-effort save
+
         self._camera.close()
         super().closeEvent(event)
 
@@ -533,8 +571,14 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
 
-    # Load config
-    config_path = os.path.join(os.path.dirname(__file__), 'config.yaml')
+    # Load config — use config.yaml next to the executable (or source file);
+    # on first run from a frozen build, extract the bundled default.
+    config_path = os.path.join(_app_dir(), 'config.yaml')
+    if not os.path.exists(config_path) and getattr(sys, 'frozen', False):
+        bundled = os.path.join(sys._MEIPASS, 'config.yaml')
+        if os.path.exists(bundled):
+            import shutil
+            shutil.copy2(bundled, config_path)
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
@@ -568,6 +612,8 @@ def main():
                 contrast=cam_cfg.get('contrast', 100),
                 analog_gain=cam_cfg.get('analog_gain', 16),
                 ae_enabled=cam_cfg.get('ae_enabled', False),
+                reverse_x=cam_cfg.get('reverse_x', False),
+                reverse_y=cam_cfg.get('reverse_y', False),
             )
             camera.apply_settings(default_settings)
 

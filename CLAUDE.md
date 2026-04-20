@@ -21,11 +21,12 @@ The application has three decoupled modules with clear boundaries:
 ### `app.py` — PySide6 UI + main loop
 
 - `MainWindow`: toolbar (Live View / Image Processing combo, Grab, Reset, Save), central `QLabel` for image display, status bar
-- `CameraSettingsWindow`: floating widget (`Qt.Tool | Qt.WindowStaysOnTopHint`) with sliders for exposure, gamma, contrast, analog gain, and auto-exposure toggle
+- `CameraSettingsWindow`: floating widget (`Qt.Tool | Qt.WindowStaysOnTopHint`) with sliders for exposure, gamma, contrast, analog gain, auto-exposure toggle, and ReverseX/ReverseY mirror checkboxes
 - `ProcessingState`: mutable state for the current processing image (BGR/RGB arrays, segmentation result, selected object IDs, click positions, distance result)
 - Mode toggle: **Live View** (continuous capture, `trigger=0`) ↔ **Image Processing** (software trigger, `trigger=1`)
 - Object picking state machine: `PICK_OBJECT1` → `PICK_OBJECT2` → `SHOW_RESULT`
 - Coordinate mapping: `_label_to_image()` reverse-maps QLabel click coordinates to original image pixels accounting for aspect-ratio scaling and centering
+- Config persistence: `_app_dir()` resolves the base directory for config.yaml (exe dir when frozen, source dir otherwise). On first run from a frozen build, the bundled default is extracted from `sys._MEIPASS`. Settings are saved to config.yaml on exit via `closeEvent()`
 
 ### `camera.py` — Camera abstraction (MindVision SDK wrapper)
 
@@ -33,7 +34,7 @@ The application has three decoupled modules with clear boundaries:
 - `_LiveViewThread(QThread)`: polls `CameraGetImageBuffer` in a loop, emits `frame_ready` signal with numpy BGR frames
 - Mode switching: `set_live_mode()` (trigger=0, starts thread), `set_trigger_mode()` (stops thread, trigger=1)
 - `software_trigger()`: fires `CameraSoftTrigger` + `CameraGetImageBuffer`, emits `grab_done` signal
-- Settings: `apply_settings(CameraSettings)` / `get_current_settings()` / `get_setting_ranges()`
+- Settings: `apply_settings(CameraSettings)` / `get_current_settings()` / `get_setting_ranges()` — includes mirror via `CameraSetMirror(hCamera, dir, enable)` where dir=0 is horizontal, dir=1 is vertical
 - Signal emitter pattern: `CameraSignalEmitter(QObject)` owns `frame_ready`, `grab_done`, `error` signals — camera class itself is not a QObject
 - Key SDK sequence for mode switch: `CameraStop` → `CameraSetTriggerMode` → `CameraPlay`
 
@@ -47,13 +48,20 @@ The application has three decoupled modules with clear boundaries:
 
 ### `config.yaml` — Parameters
 
-- `camera`: default exposure (30000 us), gamma, contrast, analog gain, AE state
+- `camera`: exposure, gamma, contrast, analog gain, AE state, reverse_x (horizontal mirror), reverse_y (vertical mirror) — saved on exit, loaded on startup
 - `processing`: pixel_size (0.117027 mm/px), gauss_sigma, morph_radius, min_region_size (500 px), watershed connectivity/max_depth
 
 ### `driver/` — MindVision camera SDK
 
-- `mvsdk.py`: full Python ctypes bindings for the MindVision SDK (`libMVSDK.so` on Linux)
+- `mvsdk.py`: full Python ctypes bindings for the MindVision SDK. On Linux loads `libMVSDK.so` via `ctypes.cdll.LoadLibrary`; when running from a PyInstaller bundle, resolves the library from `sys._MEIPASS` instead of relying on system `LD_LIBRARY_PATH`
 - `cv_grab.py`: reference sample showing continuous capture with OpenCV display
+
+### PyInstaller packaging
+
+- `qa-distance-picker.spec`: PyInstaller spec file for one-directory build. Bundles `libMVSDK.so` (from `/usr/lib/`), `config.yaml` (as default), diplib native `.so` files. Excludes torch/sam2/open3d/matplotlib. Hidden imports for `mvsdk`, `diplib`, `scipy.*`, PySide6 submodules
+- `build.sh`: reusable build script — installs PyInstaller, cleans previous build, runs `pyinstaller qa-distance-picker.spec --noconfirm`
+- Output: `dist/qa-distance-picker/` (~580 MB) — copy the entire folder to any Linux machine and run `./qa-distance-picker`
+- `camera.py` skips `sys.path.insert` for `driver/` when frozen (mvsdk found via hidden-import); `mvsdk.py` resolves `libMVSDK.so` from `sys._MEIPASS` when frozen; `app.py` uses `_app_dir()` to find config.yaml next to the executable
 
 ## Key Design Decisions
 
@@ -62,6 +70,9 @@ The application has three decoupled modules with clear boundaries:
 - **Cris Luengo method rejected**: The StackOverflow method (Gravity/GreyMajorAxes) measures perpendicular distance between entire edge regions, not facing edges — gives 25–35 mm instead of 6–8 mm. Closest boundary points is the primary method instead.
 - **Live view thread**: Subclasses `QThread` directly (not worker+moveToThread pattern) because `run_loop` is a blocking poll loop that doesn't use the Qt event loop.
 - **Exposure time units**: `CameraGetExposureTimeRange` and `CameraGetExposureTime` return **microseconds** directly (not seconds as the name might suggest).
+- **Camera mirror**: `CameraSetMirror(hCamera, direction, enable)` where direction=0 is `MIRROR_DIRECTION_HORIZONTAL` (reverse_x) and direction=1 is `MIRROR_DIRECTION_VERTICAL` (reverse_y). Read back with `CameraGetMirror(hCamera, direction)`.
+- **PyInstaller one-directory build**: A one-file build (`-F`) would decompress 500+ MB to a temp dir on every launch — slow startup and no writable config.yaml location. One-directory build allows config.yaml to live alongside the executable and be read/written persistently.
+- **Frozen detection**: `getattr(sys, 'frozen', False)` is True inside a PyInstaller bundle. `sys._MEIPASS` points to the `_internal/` directory containing bundled data/binaries. `_app_dir()` returns the executable's directory (for writable config.yaml), not `_MEIPASS` (which is read-only inside the bundle).
 
 ## Distance Measurement Accuracy
 

@@ -16,8 +16,9 @@ from typing import Optional
 
 import numpy as np
 
-# Add driver directory to path for mvsdk import
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'driver'))
+# Add driver directory to path for mvsdk import (not needed when frozen)
+if not getattr(sys, 'frozen', False):
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'driver'))
 import mvsdk
 
 from PySide6.QtCore import QObject, Signal, Slot, QThread
@@ -32,6 +33,8 @@ class CameraSettings:
     contrast: int = 100
     analog_gain: int = 16
     ae_enabled: bool = False
+    reverse_x: bool = False   # horizontal mirror (MIRROR_DIRECTION_HORIZONTAL)
+    reverse_y: bool = False   # vertical mirror (MIRROR_DIRECTION_VERTICAL)
 
 
 @dataclass
@@ -283,6 +286,8 @@ class MindVisionCamera:
             mvsdk.CameraSetGamma(self._hCamera, settings.gamma)
             mvsdk.CameraSetContrast(self._hCamera, settings.contrast)
             mvsdk.CameraSetAnalogGain(self._hCamera, settings.analog_gain)
+            mvsdk.CameraSetMirror(self._hCamera, 0, settings.reverse_x)   # 0 = horizontal
+            mvsdk.CameraSetMirror(self._hCamera, 1, settings.reverse_y)   # 1 = vertical
         except mvsdk.CameraException as e:
             self._signals.error.emit(f"Setting error: {e.message}")
 
@@ -297,12 +302,17 @@ class MindVisionCamera:
             gamma = mvsdk.CameraGetGamma(self._hCamera)
             contrast = mvsdk.CameraGetContrast(self._hCamera)
             gain = mvsdk.CameraGetAnalogGain(self._hCamera)
+            # CameraSetMirror dir=0 is horizontal, dir=1 is vertical
+            reverse_x = bool(mvsdk.CameraGetMirror(self._hCamera, 0))
+            reverse_y = bool(mvsdk.CameraGetMirror(self._hCamera, 1))
             return CameraSettings(
                 exposure_us=exposure_us,
                 gamma=gamma,
                 contrast=contrast,
                 analog_gain=gain,
                 ae_enabled=(ae != 0),
+                reverse_x=reverse_x,
+                reverse_y=reverse_y,
             )
         except mvsdk.CameraException:
             return CameraSettings()

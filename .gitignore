@@ -11,6 +11,10 @@ __pycache__/
 distance_result.png
 mask_pc.ply
 
+# PyInstaller build artifacts
+build/
+dist/
+
 # SDK runtime data (camera creates these)
 Camera/Data/
 Camera/log/

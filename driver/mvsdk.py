@@ -1,4 +1,6 @@
 #coding=utf-8
+import sys
+import os
 import platform
 from ctypes import *
 from threading import local
@@ -20,7 +22,11 @@ def _Init():
 		_sdk = windll.MVCAMSDK if is_x86 else windll.MVCAMSDK_X64
 		CALLBACK_FUNC_TYPE = WINFUNCTYPE
 	else:
-		_sdk = cdll.LoadLibrary("libMVSDK.so")
+		if getattr(sys, 'frozen', False):
+			sdk_path = os.path.join(sys._MEIPASS, 'libMVSDK.so')
+		else:
+			sdk_path = 'libMVSDK.so'
+		_sdk = cdll.LoadLibrary(sdk_path)
 		CALLBACK_FUNC_TYPE = CFUNCTYPE
 
 _Init()
