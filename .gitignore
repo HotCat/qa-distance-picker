@@ -1,0 +1,24 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Editor artifacts
+*~
+.#*
+\#*\#
+
+# Generated output
+distance_result.png
+mask_pc.ply
+
+# SDK runtime data (camera creates these)
+Camera/Data/
+Camera/log/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

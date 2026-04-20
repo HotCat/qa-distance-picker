@@ -1,0 +1,23 @@
+# Camera defaults (applied on first open)
+camera:
+  exposure_us: 30000        # 30ms default
+  gamma: 100
+  contrast: 100
+  analog_gain: 16           # gain index (16 * 0.125 = 2.0x for typical sensor)
+  ae_enabled: false
+
+# Processing parameters
+processing:
+  pixel_size: 0.117027      # mm per pixel (hardwired calibration)
+  gauss_sigma: 0.4          # Gaussian smoothing before gradient
+  morph_radius: 3           # Closing/Opening radius before watershed
+  min_region_size: 500      # minimum pixels for a valid object region
+  watershed_connectivity: 1
+  watershed_max_depth: 3
+
+# Display settings
+display:
+  overlay_alpha: 0.35       # mask blending weight
+  contour_thickness: 2
+  marker_radius: 6
+  line_thickness: 2

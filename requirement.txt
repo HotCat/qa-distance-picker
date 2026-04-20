@@ -1,0 +1,133 @@
+I want to explore sam2 prompts, like positive bounding box, positive points, negative points. I have already setup sam2 python environment, I have nvidia GTX1080 GPU, and a working sam2_autoprompt2.py script demonstrate how to use sam2's bounding box and points prompts. you can run and verify.
+
+my requirement is that I want you to create a new python script that can let me explore the sam2's prompts manually. to make this destination reachable: I want your python UI provide a basic widgets of radio check button control, that let me select wether to use positive bounding box, positive points, negative points. also a confirm button to finish selecting all the prompts. for example, I first choose to select positive points, I click left mouse button to insert an positive point on image, then I click mouse again to insert another positive point on image. then I click radio check button to select bounding box, I drag and drop the mouse to select the bounding box. then I click radio check button to select negative points, click mouse to insert one negative points, then another. I can use radio check button again to select positive points again, then click mouse to append positive points. until I click the confirm button to frozen all the prompts.
+
+you now using those collected prompts to do sam2 segmentation, show the result using opencv
+
+
+the user experience is bad, the positive/negative points selection does not select what the mouse points at. also null list of positive/negative points is allowed, null bounding box is allowed. the confirm button won't respond most of the time
+
+I did not see toolbar at bottom of window, only add positive function, no confirm button, no 1/2/3 to cycle masks, R not work, only ESC works
+
+
+
+the sam2_prompt_explorer.py works very well, now I want you writing another program base on this work. name it as sam2_distance_picker.py, the input inage is screenshot2.png. my requirement is to calculate distances between two objects, select each object with only one sam2 positive point prompt. so the operating logic is quite different from original code, no need negative points prompt or bounding box prompt. new logic is the following:
+
+1. the user select first object by clicking the points on that object region, involking sam2 to obtain that region contour
+2. the user select second object by clicking the points on that object region, involking sam2 to obtain that region contour
+3. use diplib to calculate the distances between two object's closest edges. probably you need to use randsac to fit lines between two object's edges and calculate the distance as precise as possible
+4. overlay the distance between the two object's nearest edges
+5. use diplib's SetPixelSize([0.117027, 0.117027], "mm") to setup the scale, the 0.117027 is my hardwired value, use it
+
+to makes the distance calculation more precise, please consult the following code if necessary. also you can got to https://stackoverflow.com/a/70563122 to obtain the necessary background information
+
+# Source - https://stackoverflow.com/a/70563122
+# Posted by Cris Luengo, modified by community. See post 'Timeline' for change history
+# Retrieved 2026-04-18, License - CC BY-SA 4.0
+
+import diplib as dip
+import numpy as np
+import matplotlib.pyplot as pp
+
+# load
+img = dip.ImageRead('wDnU6.jpg') 
+img = img(1)  # use green channel
+img.SetPixelSize(0.042, "mm")
+
+# find edges
+edges = dip.GradientMagnitude(img)
+
+# binarize
+mask = dip.Threshold(edges)[0]
+mask = dip.Dilation(mask, 9)  # we want the mask to include the "tails" of the Gaussian
+mask = dip.AreaOpening(mask, filterSize=1000)  # remove small regions
+
+# measure the two edges
+mask = dip.Label(mask)
+msr = dip.MeasurementTool.Measure(mask, edges, ['Gravity','GreyMajorAxes'])
+# msr[n] is the measurements for object with ID n, if we have two objects, n can be 1 or 2.
+
+# get distance between edges
+center1 = np.array(msr[1]['Gravity'])
+center2 = np.array(msr[2]['Gravity'])
+
+normal1 = np.array(msr[1]['GreyMajorAxes'])[0:2]  # first axis is perpendicular to edge
+normal2 = np.array(msr[2]['GreyMajorAxes'])[0:2]
+normal = (normal1 + normal2) / 2  # we average the two normals, assuming the edges are parallel
+
+distance = abs((center1 - center2) @ normal)
+units = msr['Gravity'].Values()[0].units
+print("Distance between lines:", distance, units)
+
+
+
+
+
+I think you misunderstand this SetPixelSize api, it only setup once for the input image. after this is setup, diplib automatically count this unit scale. so the measurement result is totally wrong, when I select the same two objects, the result can variant 1-3 mm, give the annotated human virtual segment length is not significant difference.
+
+
+I give you a ok and a ng scenario. ok.png show the right result, while ng.png does not, I expect approximate 6.0mm, but the got 0.117mm
+
+I don't think the failed case, the two region overlapped. look at the another failed case: ng2.png, the two region were not overlapped at all, but the result is still 0.117mm. another issues, could you please offset the distance annotation caption a little from the green line, so I can see both end of green line
+
+
+I am looking carefully that the sam2 does not do this job right, in fact the two region overlaped case the algorithm confusing. now I command you to get ride of sam2 entirely, use diplib's watershed algorithm instead to select the object regions. please consult segment.py, after wlab = dip.SmallObjectsRemove(wlab, 2000), watershed algorithm divids the images into objects, each objects with an ID. in this particular case, I want you first focus on calcuate the distance between two objects.
+
+still prefer the following method:
+
+# Source - https://stackoverflow.com/a/70563122
+# Posted by Cris Luengo, modified by community. See post 'Timeline' for change history
+# Retrieved 2026-04-18, License - CC BY-SA 4.0
+
+import diplib as dip
+import numpy as np
+import matplotlib.pyplot as pp
+
+# load
+img = dip.ImageRead('wDnU6.jpg') 
+img = img(1)  # use green channel
+img.SetPixelSize(0.042, "mm")
+
+# find edges
+edges = dip.GradientMagnitude(img)
+
+# binarize
+mask = dip.Threshold(edges)[0]
+mask = dip.Dilation(mask, 9)  # we want the mask to include the "tails" of the Gaussian
+mask = dip.AreaOpening(mask, filterSize=1000)  # remove small regions
+
+# measure the two edges
+mask = dip.Label(mask)
+msr = dip.MeasurementTool.Measure(mask, edges, ['Gravity','GreyMajorAxes'])
+# msr[n] is the measurements for object with ID n, if we have two objects, n can be 1 or 2.
+
+# get distance between edges
+center1 = np.array(msr[1]['Gravity'])
+center2 = np.array(msr[2]['Gravity'])
+
+normal1 = np.array(msr[1]['GreyMajorAxes'])[0:2]  # first axis is perpendicular to edge
+normal2 = np.array(msr[2]['GreyMajorAxes'])[0:2]
+normal = (normal1 + normal2) / 2  # we average the two normals, assuming the edges are parallel
+
+distance = abs((center1 - center2) @ normal)
+units = msr['Gravity'].Values()[0].units
+print("Distance between lines:", distance, units)
+
+
+
+I want you first calculate the distance between object ID 2773 and ID 2677, the distance approximate 8.00 mm and this value should not fluctuate much, diplib is very stable doing this. no influence by sam2 anymore. also verify the distance between object ID 9359 and ID 2677, it should be approximate 6.00 mm
+
+when your verification is complete, please modify the UI to get rid of sam2. but preserve the point selection function, that points is used for select the object ID which is generated by watershed algorithm. you have to map the point coordinate to the right object ID, so the distance calculation can be done
+
+
+
+
+
+
+sam2_distance_picker.py works very well, but I want to continue evolute on it. I want to integrate industrial camera, not just read from a image file. so the UI need to support camera live view, a floating windows to adjust camera settings like exposure, gamma, contrast etc, a toggle control switching between live viewing mode to image processing mode. when in image processing mode, the camera was software triggered and does not continues capture image.
+
+I want you first use PySide6 for UI, checkout ./driver directory, that directory contain my industrial camera sdk and sample code, you should try to figure out how it works. especially how to switch between continues image capture mode and software triggered image capture mode.
+
+your scaffold of UI design should be as independent as possible, should not tight coupling with functional module like opencv/diplib processing, camera capture module. in image processing mode, there's an image grab button, use software trigger to grab a new camera frame.
+
+when you finish coding, I should see the camera live view, I could adjust the camera settings. then I toggle into the image processing mode, the UI show the last preview image. I could press image grab button, I could see current grabbed image. then I should start processing the image as it is 
