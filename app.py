@@ -16,6 +16,7 @@ import numpy as np
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QComboBox,
     QPushButton, QToolBar, QStatusBar, QSlider, QSpinBox,
+    QDoubleSpinBox,
     QCheckBox, QFormLayout, QGroupBox, QHBoxLayout, QVBoxLayout,
     QTreeWidget, QTreeWidgetItem, QHeaderView,
     QMessageBox,
@@ -31,6 +32,7 @@ from processing import (
 from calibration import CalibrationWorker, CalibrationResult
 from detect_lines import (
     LinesArcsWorker, LinesArcsResult, FeatureDescriptor,
+    render_annotations,
 )
 
 
@@ -182,17 +184,74 @@ class CameraSettingsWindow(QWidget):
 # ════════════════════════════════════════════════════════════════════════
 
 class ResultsWindow(QWidget):
-    """Floating tree view showing detected lines and arcs."""
+    """Floating tree view showing detected lines and arcs with filter controls."""
+
+    item_selected = Signal(str, str)  # ("line"|"arc", id) or ("", "")
+    filters_changed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Detection Results")
         self.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint)
-        self.setMinimumSize(420, 300)
+        self.setMinimumSize(480, 350)
+        self._full_result: LinesArcsResult | None = None
+        self._block_filters = False
         self._build_ui()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
+
+        # ── Filter bar ──────────────────────────────────────────────
+        filter_layout = QHBoxLayout()
+
+        # Line length filter
+        filter_layout.addWidget(QLabel("Line len:"))
+        self._line_min_spin = QDoubleSpinBox()
+        self._line_min_spin.setRange(0.0, 500.0)
+        self._line_min_spin.setDecimals(1)
+        self._line_min_spin.setSingleStep(0.5)
+        self._line_min_spin.setSuffix(" mm")
+        self._line_min_spin.setValue(3.0)
+        self._line_min_spin.valueChanged.connect(self._on_filter_changed)
+        filter_layout.addWidget(self._line_min_spin)
+
+        filter_layout.addWidget(QLabel("–"))
+        self._line_max_spin = QDoubleSpinBox()
+        self._line_max_spin.setRange(0.0, 500.0)
+        self._line_max_spin.setDecimals(1)
+        self._line_max_spin.setSingleStep(0.5)
+        self._line_max_spin.setSuffix(" mm")
+        self._line_max_spin.setValue(200.0)
+        self._line_max_spin.valueChanged.connect(self._on_filter_changed)
+        filter_layout.addWidget(self._line_max_spin)
+
+        filter_layout.addSpacing(12)
+
+        # Arc radius filter
+        filter_layout.addWidget(QLabel("Arc r:"))
+        self._arc_min_spin = QDoubleSpinBox()
+        self._arc_min_spin.setRange(0.0, 500.0)
+        self._arc_min_spin.setDecimals(1)
+        self._arc_min_spin.setSingleStep(0.5)
+        self._arc_min_spin.setSuffix(" mm")
+        self._arc_min_spin.setValue(1.0)
+        self._arc_min_spin.valueChanged.connect(self._on_filter_changed)
+        filter_layout.addWidget(self._arc_min_spin)
+
+        filter_layout.addWidget(QLabel("–"))
+        self._arc_max_spin = QDoubleSpinBox()
+        self._arc_max_spin.setRange(0.0, 500.0)
+        self._arc_max_spin.setDecimals(1)
+        self._arc_max_spin.setSingleStep(0.5)
+        self._arc_max_spin.setSuffix(" mm")
+        self._arc_max_spin.setValue(50.0)
+        self._arc_max_spin.valueChanged.connect(self._on_filter_changed)
+        filter_layout.addWidget(self._arc_max_spin)
+
+        filter_layout.addStretch()
+        layout.addLayout(filter_layout)
+
+        # ── Tree ────────────────────────────────────────────────────
         self._tree = QTreeWidget()
         self._tree.setHeaderLabels(["ID", "Category", "Length (mm)", "Angle (°)", "Radius (mm)"])
         header = self._tree.header()
@@ -202,35 +261,88 @@ class ResultsWindow(QWidget):
         header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self._tree.setAlternatingRowColors(True)
+        self._tree.setSelectionMode(QTreeWidget.SingleSelection)
+        self._tree.currentItemChanged.connect(self._on_selection_changed)
         layout.addWidget(self._tree)
 
-    def update_results(self, result: LinesArcsResult):
+    def _on_filter_changed(self):
+        if self._block_filters or self._full_result is None:
+            return
+        self._apply_filters()
+        self.filters_changed.emit()
+
+    def _apply_filters(self):
+        result = self._full_result
+        line_lo = self._line_min_spin.value()
+        line_hi = self._line_max_spin.value()
+        arc_lo = self._arc_min_spin.value()
+        arc_hi = self._arc_max_spin.value()
+
+        filtered_lines = [lr for lr in result.lines
+                         if line_lo <= lr.length_mm <= line_hi]
+        filtered_arcs = [ar for ar in result.arcs
+                        if arc_lo <= ar.radius_mm <= arc_hi]
+
+        self._populate_tree(filtered_lines, filtered_arcs)
+
+    def _populate_tree(self, lines, arcs):
         self._tree.clear()
-
-        lines_item = QTreeWidgetItem(self._tree, ["Lines", "", "", "", ""])
-        lines_item.setExpanded(True)
-        font = lines_item.font(0)
+        font = self._tree.font()
         font.setBold(True)
-        lines_item.setFont(0, font)
 
-        for lr in result.lines:
-            child = QTreeWidgetItem(lines_item, [
+        lines_item = QTreeWidgetItem(self._tree, [f"Lines ({len(lines)})", "", "", "", ""])
+        lines_item.setExpanded(True)
+        lines_item.setFont(0, font)
+        for lr in lines:
+            QTreeWidgetItem(lines_item, [
                 lr.id, lr.category,
                 f"{lr.length_mm:.2f}",
                 f"{lr.angle_deg:.1f}",
                 "",
             ])
 
-        arcs_item = QTreeWidgetItem(self._tree, ["Curves", "", "", "", ""])
+        arcs_item = QTreeWidgetItem(self._tree, [f"Curves ({len(arcs)})", "", "", "", ""])
         arcs_item.setExpanded(True)
         arcs_item.setFont(0, font)
-
-        for ar in result.arcs:
-            child = QTreeWidgetItem(arcs_item, [
+        for ar in arcs:
+            QTreeWidgetItem(arcs_item, [
                 ar.id, "",
                 "", "",
                 f"{ar.radius_mm:.2f}",
             ])
+
+    def set_filters_from_config(self, det_cfg: dict):
+        self._block_filters = True
+        self._line_min_spin.setValue(det_cfg.get('line_min_mm', 3.0))
+        self._line_max_spin.setValue(det_cfg.get('line_max_mm', 200.0))
+        self._arc_min_spin.setValue(det_cfg.get('arc_min_mm', 1.0))
+        self._arc_max_spin.setValue(det_cfg.get('arc_max_mm', 50.0))
+        self._block_filters = False
+
+    def filter_values(self) -> dict:
+        return {
+            'line_min_mm': self._line_min_spin.value(),
+            'line_max_mm': self._line_max_spin.value(),
+            'arc_min_mm': self._arc_min_spin.value(),
+            'arc_max_mm': self._arc_max_spin.value(),
+        }
+
+    def _on_selection_changed(self, current, _previous):
+        if current is None or current.parent() is None:
+            self.item_selected.emit("", "")
+            return
+        item_id = current.text(0)
+        parent_text = current.parent().text(0)
+        if parent_text.startswith("Lines"):
+            self.item_selected.emit("line", item_id)
+        elif parent_text.startswith("Curves"):
+            self.item_selected.emit("arc", item_id)
+        else:
+            self.item_selected.emit("", "")
+
+    def update_results(self, result: LinesArcsResult):
+        self._full_result = result
+        self._apply_filters()
 
 class ProcessingState:
     """Holds all mutable state for the current processing image."""
@@ -267,6 +379,8 @@ class MainWindow(QMainWindow):
         self._calib_pending: bool = False
         self._active_worker: QThread | None = None
         self._template_features: list[FeatureDescriptor] | None = None
+        self._template_arc_grid: dict | None = None
+        self._last_arclines_result: LinesArcsResult | None = None
 
         self._build_ui()
         self._connect_signals()
@@ -328,7 +442,6 @@ class MainWindow(QMainWindow):
 
         # Detection results window (floating)
         self._results_window = ResultsWindow(self)
-
     # ── Signal wiring ───────────────────────────────────────────────
 
     def _connect_signals(self):
@@ -348,6 +461,12 @@ class MainWindow(QMainWindow):
         # Settings → camera
         self._settings_window.settings_changed.connect(
             self._camera.apply_settings)
+
+        # Results window → highlight and filter
+        self._results_window.item_selected.connect(
+            self._on_result_item_selected)
+        self._results_window.filters_changed.connect(
+            self._on_filters_changed)
 
     # ── Slots: camera frames ────────────────────────────────────────
 
@@ -389,6 +508,8 @@ class MainWindow(QMainWindow):
     def _on_reset(self):
         """Reset picker state, keep current image."""
         self._picker_state = PICK_OBJECT1
+        self._last_arclines_result = None
+        self._template_arc_grid = None
         if self._proc_state:
             self._proc_state.obj1_id = None
             self._proc_state.obj2_id = None
@@ -432,12 +553,15 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
 
         proc_cfg = self._config.get('processing', {})
+        det_cfg = self._config.get('detection', {})
         worker = LinesArcsWorker(
             self._proc_state.image_bgr,
             self._processor.pixel_size,
             gauss_sigma=proc_cfg.get('gauss_sigma', 0.4),
             morph_radius=proc_cfg.get('morph_radius', 3),
             template=self._template_features,
+            grid_size_mm=det_cfg.get('grid_size_mm', 5.0),
+            template_arc_grid=self._template_arc_grid,
         )
         worker.done.connect(self._on_arclines_done)
         worker.error.connect(self._on_worker_error)
@@ -475,8 +599,9 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _on_arclines_done(self, result: LinesArcsResult):
-        """Line/arc detection finished — display annotated image and results."""
+        """Line/arc detection finished — store result and render."""
         self._active_worker = None
+        self._last_arclines_result = result
 
         # Store template from first run
         if self._template_features is None:
@@ -485,17 +610,15 @@ class MainWindow(QMainWindow):
                 descs.append(FeatureDescriptor(
                     id=lr.id, centroid_mm=lr.centroid_mm,
                     primary=lr.angle_deg, secondary=lr.length_mm))
-            for ar in result.arcs:
-                descs.append(FeatureDescriptor(
-                    id=ar.id, centroid_mm=ar.centroid_mm,
-                    primary=ar.radius_mm, secondary=0))
             self._template_features = descs
 
-        if result.annotated_bgr is not None:
-            self._display_image(result.annotated_bgr)
+        if self._template_arc_grid is None:
+            self._template_arc_grid = result.arc_grid
 
         self._results_window.update_results(result)
         self._results_window.show()
+
+        self._render_arclines()
 
         n_lines = len(result.lines)
         n_arcs = len(result.arcs)
@@ -509,6 +632,41 @@ class MainWindow(QMainWindow):
         self._active_worker = None
         self._status_label.setText(f"Error: {msg}")
 
+    # ── Render pipeline ───────────────────────────────────────────────
+
+    @Slot(str, str)
+    def _on_result_item_selected(self, feature_type: str, feature_id: str):
+        """Tree node selected — re-render with highlight."""
+        self._render_arclines(highlight_type=feature_type,
+                              highlight_id=feature_id)
+
+    def _on_filters_changed(self):
+        """Filter thresholds changed — re-render and update tree."""
+        if self._last_arclines_result is not None:
+            self._results_window._apply_filters()
+            self._render_arclines()
+
+    def _render_arclines(self, highlight_type="", highlight_id=""):
+        """Render annotated image from detection data with current filters."""
+        result = self._last_arclines_result
+        if result is None or self._proc_state is None:
+            return
+        image = self._proc_state.image_bgr
+        if image is None:
+            return
+
+        # Apply filters
+        fv = self._results_window.filter_values()
+        filtered_lines = [lr for lr in result.lines
+                         if fv['line_min_mm'] <= lr.length_mm <= fv['line_max_mm']]
+        filtered_arcs = [ar for ar in result.arcs
+                        if fv['arc_min_mm'] <= ar.radius_mm <= fv['arc_max_mm']]
+
+        annotated = render_annotations(
+            image, filtered_lines, filtered_arcs,
+            highlight_type=highlight_type, highlight_id=highlight_id)
+        self._display_image(annotated)
+
     # ── Mode transitions ────────────────────────────────────────────
 
     def _switch_to_live(self):
@@ -521,6 +679,8 @@ class MainWindow(QMainWindow):
         self._arclines_btn.setEnabled(False)
         self._image_label.setCursor(Qt.ArrowCursor)
         self._proc_state = None
+        self._last_arclines_result = None
+        self._template_arc_grid = None
         self._camera.set_live_mode()
         self._status_label.setText("Live View")
 
@@ -731,6 +891,11 @@ class MainWindow(QMainWindow):
         cam_cfg['reverse_y'] = self._settings_window._reverse_y_check.isChecked()
         self._config['camera'] = cam_cfg
 
+        # Save detection filter values
+        det_cfg = self._config.get('detection', {})
+        det_cfg.update(self._results_window.filter_values())
+        self._config['detection'] = det_cfg
+
         config_path = os.path.join(_app_dir(), 'config.yaml')
         try:
             with open(config_path, 'w') as f:
@@ -813,6 +978,8 @@ def main():
             "No camera found — connect camera and restart")
 
     window._settings_window.show()
+    window._results_window.set_filters_from_config(
+        config.get('detection', {}))
 
     sys.exit(app.exec())
 

@@ -46,7 +46,7 @@ class ArcResult:
 class LinesArcsResult:
     lines: list[LineResult] = field(default_factory=list)
     arcs: list[ArcResult] = field(default_factory=list)
-    annotated_bgr: Optional[np.ndarray] = None
+    arc_grid: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -473,6 +473,40 @@ def match_features(
     return result
 
 
+def _assign_arc_ids_by_grid(arcs, grid_size_mm, template_grid=None):
+    """Assign stable arc IDs based on grid-cell + radius bucket.
+
+    Key = (grid_row, grid_col, radius_bucket) where radius_bucket =
+    int(radius_mm).  This handles multiple arcs per cell with different radii.
+
+    If template_grid is provided (from first run), arcs in the same
+    (row, col, radius_bucket) inherit the template ID.
+
+    Returns:
+        grid_map: dict mapping (row, col, radius_bucket) -> (id, radius_mm)
+    """
+    grid_map = {}
+
+    for ar in arcs:
+        gx = int(ar.centroid_mm[0] // grid_size_mm)
+        gy = int(ar.centroid_mm[1] // grid_size_mm)
+        rb = int(ar.radius_mm)
+
+        key = (gy, gx, rb)
+
+        if template_grid and key in template_grid:
+            t_id, t_radius = template_grid[key]
+            if abs(ar.radius_mm - t_radius) / max(t_radius, 1.0) < 0.3:
+                ar.id = t_id
+
+        if not ar.id:
+            ar.id = f"C{gy}_{gx}_{rb}"
+
+        grid_map[key] = (ar.id, ar.radius_mm)
+
+    return grid_map
+
+
 # ── Main detection pipeline ────────────────────────────────────────────
 
 def detect_lines_and_arcs(
@@ -481,6 +515,8 @@ def detect_lines_and_arcs(
     gauss_sigma: float = 0.4,
     morph_radius: int = 3,
     template: Optional[list[FeatureDescriptor]] = None,
+    grid_size_mm: float = 5.0,
+    template_arc_grid: Optional[dict] = None,
 ) -> LinesArcsResult:
     """Detect lines and arcs in an image.
 
@@ -489,7 +525,9 @@ def detect_lines_and_arcs(
         pixel_size_mm: mm per pixel (from calibration or config).
         gauss_sigma: Gaussian smoothing before gradient.
         morph_radius: Closing/Opening radius before watershed.
-        template: If provided, match detected features to these template IDs.
+        template: If provided, match LINE features to template IDs (Hungarian).
+        grid_size_mm: Grid cell size in mm for arc ID assignment.
+        template_arc_grid: If provided, match ARC IDs to template grid map.
 
     Returns:
         LinesArcsResult with detected lines, arcs, and annotated image.
@@ -557,33 +595,19 @@ def detect_lines_and_arcs(
 
     # Assign IDs
     if template is not None:
-        # Build detection descriptors for matching
         line_descs = [FeatureDescriptor(
             id="", centroid_mm=lr.centroid_mm,
             primary=lr.angle_deg, secondary=lr.length_mm
         ) for lr in line_results]
-        arc_descs = [FeatureDescriptor(
-            id="", centroid_mm=ar.centroid_mm,
-            primary=ar.radius_mm, secondary=0
-        ) for ar in arc_results]
 
-        # Separate template into lines and arcs
         t_lines = [f for f in template if f.id.startswith('L')]
-        t_arcs = [f for f in template if f.id.startswith('C')]
 
-        # Match
         line_mapping = match_features(t_lines, line_descs)
         for idx, tid in line_mapping.items():
             if tid is not None:
                 line_results[idx].id = tid
 
-        arc_mapping = match_features(t_arcs, arc_descs)
-        for idx, tid in arc_mapping.items():
-            if tid is not None:
-                arc_results[idx].id = tid
-
-    # Assign sequential IDs to unmatched features
-    existing_line_ids = {lr.id for lr in line_results if lr.id}
+    # Assign sequential IDs to unmatched lines
     line_counter = max(
         (int(lr.id[1:]) for lr in line_results if lr.id.startswith('L')),
         default=0)
@@ -592,61 +616,106 @@ def detect_lines_and_arcs(
             line_counter += 1
             lr.id = f"L{line_counter}"
 
-    existing_arc_ids = {ar.id for ar in arc_results if ar.id}
-    arc_counter = max(
-        (int(ar.id[1:]) for ar in arc_results if ar.id.startswith('C')),
-        default=0)
-    for ar in arc_results:
-        if not ar.id:
-            arc_counter += 1
-            ar.id = f"C{arc_counter}"
-
-    # Build annotated image
-    result_cv = image_bgr.copy()
-    font = cv2.FONT_HERSHEY_SIMPLEX
-
-    line_colors = {"H": (0, 255, 0), "V": (0, 255, 255),
-                   "D": (0, 165, 255), "O": (255, 100, 100)}
-    for lr in line_results:
-        color = line_colors[lr.category]
-        p1 = lr.start_px.astype(int)
-        p2 = lr.end_px.astype(int)
-        cv2.line(result_cv, tuple(p1), tuple(p2), color, 2, cv2.LINE_AA)
-        cv2.circle(result_cv, tuple(p1), 4, color, -1)
-        cv2.circle(result_cv, tuple(p2), 4, color, -1)
-        mid = ((p1 + p2) // 2)
-        label = f"{lr.id}({lr.category}): {lr.length_mm:.1f}mm {lr.angle_deg:.1f}deg"
-        (tw, th), _ = cv2.getTextSize(label, font, 0.35, 1)
-        cv2.rectangle(result_cv, (mid[0] - 2, mid[1] - th - 4),
-                       (mid[0] + tw + 2, mid[1] + 4), (0, 0, 0), -1)
-        cv2.putText(result_cv, label, (mid[0], mid[1]),
-                    font, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
-
-    arc_colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
-                  (255, 0, 255), (0, 255, 255), (128, 255, 0), (255, 128, 0)]
-    for i, ar in enumerate(arc_results):
-        cx, cy = int(ar.center_px[0]), int(ar.center_px[1])
-        r = int(ar.radius_px)
-        color = arc_colors[i % len(arc_colors)]
-        cv2.circle(result_cv, (cx, cy), r, color, 2, cv2.LINE_AA)
-        cv2.circle(result_cv, (cx, cy), 3, color, -1)
-        label = f"{ar.id}: r={ar.radius_mm:.2f}mm"
-        (tw, th), _ = cv2.getTextSize(label, font, 0.38, 1)
-        tx, ty = cx + 8, cy - 8
-        if tx + tw + 4 > result_cv.shape[1]:
-            tx = cx - tw - 12
-        if ty - th - 4 < 0:
-            ty = cy + 20
-        cv2.rectangle(result_cv, (tx - 2, ty - th - 4),
-                       (tx + tw + 2, ty + 4), (0, 0, 0), -1)
-        cv2.putText(result_cv, label, (tx, ty),
-                    font, 0.38, (255, 255, 255), 1, cv2.LINE_AA)
+    # Assign arc IDs via grid cells
+    arc_grid = _assign_arc_ids_by_grid(arc_results, grid_size_mm, template_arc_grid)
 
     return LinesArcsResult(
         lines=line_results,
         arcs=arc_results,
-        annotated_bgr=result_cv,
+        arc_grid=arc_grid,
     )
+
+
+# ── Annotation rendering ───────────────────────────────────────────────
+
+LINE_COLORS = {"H": (0, 255, 0), "V": (0, 255, 255),
+               "D": (0, 165, 255), "O": (255, 100, 100)}
+
+ARC_PALETTE = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
+               (255, 0, 255), (0, 255, 255), (128, 255, 0), (255, 128, 0)]
+
+
+def render_annotations(
+    image_bgr: np.ndarray,
+    lines: list[LineResult],
+    arcs: list[ArcResult],
+    highlight_type: str = "",
+    highlight_id: str = "",
+) -> np.ndarray:
+    """Draw line and arc annotations onto a copy of image_bgr.
+
+    Args:
+        image_bgr: Original BGR image.
+        lines: Line results to draw.
+        arcs: Arc results to draw.
+        highlight_type: "line" or "arc" to highlight one feature.
+        highlight_id: ID of the feature to highlight.
+
+    Returns:
+        Annotated BGR image.
+    """
+    canvas = image_bgr.copy()
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    for lr in lines:
+        color = LINE_COLORS[lr.category]
+        p1 = lr.start_px.astype(int)
+        p2 = lr.end_px.astype(int)
+        cv2.line(canvas, tuple(p1), tuple(p2), color, 2, cv2.LINE_AA)
+        cv2.circle(canvas, tuple(p1), 4, color, -1)
+        cv2.circle(canvas, tuple(p2), 4, color, -1)
+        mid = ((p1 + p2) // 2)
+        label = f"{lr.id}({lr.category}): {lr.length_mm:.1f}mm {lr.angle_deg:.1f}deg"
+        (tw, th), _ = cv2.getTextSize(label, font, 0.35, 1)
+        cv2.rectangle(canvas, (mid[0] - 2, mid[1] - th - 4),
+                       (mid[0] + tw + 2, mid[1] + 4), (0, 0, 0), -1)
+        cv2.putText(canvas, label, (mid[0], mid[1]),
+                    font, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+
+    for i, ar in enumerate(arcs):
+        cx, cy = int(ar.center_px[0]), int(ar.center_px[1])
+        r = int(ar.radius_px)
+        color = ARC_PALETTE[i % len(ARC_PALETTE)]
+        cv2.circle(canvas, (cx, cy), r, color, 2, cv2.LINE_AA)
+        cv2.circle(canvas, (cx, cy), 3, color, -1)
+        label = f"{ar.id}: r={ar.radius_mm:.2f}mm"
+        (tw, th), _ = cv2.getTextSize(label, font, 0.38, 1)
+        tx, ty = cx + 8, cy - 8
+        if tx + tw + 4 > canvas.shape[1]:
+            tx = cx - tw - 12
+        if ty - th - 4 < 0:
+            ty = cy + 20
+        cv2.rectangle(canvas, (tx - 2, ty - th - 4),
+                       (tx + tw + 2, ty + 4), (0, 0, 0), -1)
+        cv2.putText(canvas, label, (tx, ty),
+                    font, 0.38, (255, 255, 255), 1, cv2.LINE_AA)
+
+    # Highlight overlay
+    if highlight_type == "arc" and highlight_id:
+        for i, ar in enumerate(arcs):
+            if ar.id == highlight_id:
+                cx, cy = int(ar.center_px[0]), int(ar.center_px[1])
+                r = int(ar.radius_px)
+                color = ARC_PALETTE[i % len(ARC_PALETTE)]
+                overlay = canvas.copy()
+                cv2.circle(overlay, (cx, cy), r, color, -1)
+                cv2.addWeighted(overlay, 0.3, canvas, 0.7, 0, dst=canvas)
+                break
+
+    elif highlight_type == "line" and highlight_id:
+        for lr in lines:
+            if lr.id == highlight_id:
+                color = LINE_COLORS.get(lr.category, (255, 255, 255))
+                p1 = lr.start_px.astype(int)
+                p2 = lr.end_px.astype(int)
+                mid = ((p1 + p2) // 2)
+                arrow_start = (mid + np.array([0, -30])).astype(int)
+                cv2.arrowedLine(canvas, tuple(arrow_start), tuple(mid),
+                                color, 3, tipLength=0.4)
+                cv2.line(canvas, tuple(p1), tuple(p2), color, 3, cv2.LINE_AA)
+                break
+
+    return canvas
 
 
 # ── Async worker for UI ─────────────────────────────────────────────────
@@ -659,13 +728,17 @@ class LinesArcsWorker(QThread):
 
     def __init__(self, image_bgr: np.ndarray, pixel_size_mm: float,
                  gauss_sigma: float = 0.4, morph_radius: int = 3,
-                 template: Optional[list[FeatureDescriptor]] = None):
+                 template: Optional[list[FeatureDescriptor]] = None,
+                 grid_size_mm: float = 5.0,
+                 template_arc_grid: Optional[dict] = None):
         super().__init__()
         self._image = image_bgr.copy()
         self._pixel_size_mm = pixel_size_mm
         self._gauss_sigma = gauss_sigma
         self._morph_radius = morph_radius
         self._template = template
+        self._grid_size_mm = grid_size_mm
+        self._template_arc_grid = template_arc_grid
 
     def run(self):
         try:
@@ -674,6 +747,8 @@ class LinesArcsWorker(QThread):
                 gauss_sigma=self._gauss_sigma,
                 morph_radius=self._morph_radius,
                 template=self._template,
+                grid_size_mm=self._grid_size_mm,
+                template_arc_grid=self._template_arc_grid,
             )
             self.done.emit(result)
         except Exception as e:

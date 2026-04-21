@@ -28,7 +28,8 @@ The application has three decoupled modules with clear boundaries:
 - Coordinate mapping: `_label_to_image()` reverse-maps QLabel click coordinates to original image pixels accounting for aspect-ratio scaling and centering
 - Config persistence: `_app_dir()` resolves the base directory for config.yaml (exe dir when frozen, source dir otherwise). On first run from a frozen build, the bundled default is extracted from `sys._MEIPASS`. Settings are saved to config.yaml on exit via `closeEvent()`
 - Calibration: `_calib_pending` flag intercepts `grab_done` signal to route grabbed frames to `CalibrationWorker` instead of normal processing. On success, updates `WatershedProcessor.pixel_size` and writes new value to config
-- Arclines: runs `LinesArcsWorker` on the current processing image asynchronously, displays annotated BGR result. Stores feature descriptors as template on first run for stable ID matching across subsequent runs. Shows results in `ResultsWindow` floating tree view
+- Arclines: runs `LinesArcsWorker` on the current processing image asynchronously, displays annotated BGR result. Stores line feature descriptors as template on first run for stable ID matching via Hungarian algorithm. Arc IDs use grid-cell-based assignment (key = row, col, radius_bucket) for tolerance to sample drift. Shows results in `ResultsWindow` floating tree view
+- `ResultsWindow`: floating `QTreeWidget` with Lines/Curves top-level items. Filter bar with QDoubleSpinBox controls for line length range (min/max mm) and arc radius range (min/max mm). Emits `item_selected(str, str)` signal on selection change. Clicking a line child highlights it with an arrow at midpoint + thicker line in category color. Clicking an arc child fills the fitted circle with semi-transparent color. Clicking a top-level item or clearing selection removes the highlight. Filter values saved to `config.yaml` under `detection` section
 
 ### `camera.py` — Camera abstraction (MindVision SDK wrapper)
 
@@ -53,6 +54,7 @@ The application has three decoupled modules with clear boundaries:
 - `camera`: exposure, gamma, contrast, analog gain, AE state, reverse_x (horizontal mirror), reverse_y (vertical mirror) — saved on exit, loaded on startup
 - `processing`: pixel_size (updated by calibration), gauss_sigma, morph_radius, min_region_size (500 px), watershed connectivity/max_depth
 - `calibration`: board_cols (inner corners horizontal), board_rows (inner corners vertical), grid_size_mm (physical grid square size)
+- `detection`: line_min_mm, line_max_mm (line length filter range), arc_min_mm, arc_max_mm (arc radius filter range), grid_size_mm (grid cell size for arc ID assignment)
 
 ### `calibration.py` — Chessboard pixel-size calibration
 
@@ -62,10 +64,11 @@ The application has three decoupled modules with clear boundaries:
 
 ### `detect_lines.py` — Line and arc detection with stable ID mapping
 
-- `detect_lines_and_arcs(image_bgr, pixel_size_mm, gauss_sigma, morph_radius, template)`: full pipeline — DIPlib watershed → LSD line detection (`detect_lines`) + collinear merge → curvature-based arc detection (`detect_arcs_for_object`) per watershed object → `deduplicate_cross_object_arcs` → convert to mm → stable ID assignment → annotated BGR image
-- Stable ID matching: `match_features(template, detections)` uses Hungarian algorithm (`scipy.optimize.linear_sum_assignment`) with rigid transform estimation (SVD) to assign consistent IDs across repeated measurements. Tolerates ±10mm spatial offset and ±15° rotation. Lines get IDs `L1, L2, ...`, arcs get `C1, C2, ...`
+- `detect_lines_and_arcs(image_bgr, pixel_size_mm, gauss_sigma, morph_radius, template, grid_size_mm, template_arc_grid)`: full pipeline — DIPlib watershed → LSD line detection (`detect_lines`) + collinear merge → curvature-based arc detection (`detect_arcs_for_object`) per watershed object → `deduplicate_cross_object_arcs` → convert to mm → stable ID assignment → annotated BGR image
+- Line ID matching: `match_features(template, detections)` uses Hungarian algorithm (`scipy.optimize.linear_sum_assignment`) with mean-centroid translation alignment. Lines get IDs `L1, L2, ...`
+- Arc ID matching: `_assign_arc_ids_by_grid` uses grid-cell-based assignment. Key = (grid_row, grid_col, int(radius_mm)). Arcs in the same cell with similar radius on subsequent runs inherit the template ID. Configurable grid size (default 5mm). Arcs get IDs like `C5_22_2`
 - Helper functions: `detect_lines` (LSD + merge), `merge_collinear_lines`, `detect_arcs_for_object` (contour → curvature → RANSAC), `deduplicate_cross_object_arcs`, `compute_curvature`, `extract_arc_region`, `ransac_fit_circle`, `solve_circle_from_3_points`
-- Data types: `LineResult` (id, category H/V/D/O, endpoints, length_mm, angle_deg, centroid_mm), `ArcResult` (id, center, radius, centroid_mm), `LinesArcsResult`, `FeatureDescriptor`
+- Data types: `LineResult` (id, category H/V/D/O, endpoints, length_mm, angle_deg, centroid_mm), `ArcResult` (id, center, radius, centroid_mm), `LinesArcsResult` (includes `arc_grid` dict for template), `FeatureDescriptor`
 - `LinesArcsWorker(QThread)`: runs `detect_lines_and_arcs` in background thread, emits `done(LinesArcsResult)` or `error(str)`
 
 ### `driver/` — MindVision camera SDK

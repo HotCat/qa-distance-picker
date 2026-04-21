@@ -22,3 +22,9 @@ calibration:
   board_cols: 11
   board_rows: 8
   grid_size_mm: 5.0
+detection:
+  line_min_mm: 20.0
+  line_max_mm: 200.0
+  arc_min_mm: 2.0
+  arc_max_mm: 6.0
+  grid_size_mm: 5.0
