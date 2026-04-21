@@ -39,6 +39,8 @@ a = Analysis(
     ] + diplib_datas,
     hiddenimports=[
         'mvsdk',
+        'calibration',
+        'detect_lines',
         'PySide6.QtWidgets',
         'PySide6.QtCore',
         'PySide6.QtGui',

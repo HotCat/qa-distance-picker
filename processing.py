@@ -314,6 +314,7 @@ class OverlayRenderer:
         click2: Optional[tuple[int, int]],
         result: Optional[DistanceResult],
         overlay_alpha: float = 0.35,
+        pixel_size: float = 0.117027,
     ) -> np.ndarray:
         """Render overlays onto a copy of canvas. Returns composited BGR image."""
         out = canvas.copy()
@@ -386,8 +387,8 @@ class OverlayRenderer:
         cv2.addWeighted(hud, 0.65, out[img_h - bar_h:img_h, :img_w], 0.35, 0,
                         dst=out[img_h - bar_h:img_h, :img_w])
 
-        pixel_size = 0.117027  # read from result or hardcoded
-        hud_text = f"Scale: {pixel_size} mm/px"
+        pixel_size_mm = pixel_size
+        hud_text = f"Scale: {pixel_size_mm} mm/px"
         if result is not None:
             hud_text += f"  |  Distance: {result.distance_mm:.3f} mm"
         cv2.putText(out, hud_text, (8, img_h - 7),

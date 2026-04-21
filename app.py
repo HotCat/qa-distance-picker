@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QComboBox,
     QPushButton, QToolBar, QStatusBar, QSlider, QSpinBox,
     QCheckBox, QFormLayout, QGroupBox, QHBoxLayout, QVBoxLayout,
+    QTreeWidget, QTreeWidgetItem, QHeaderView,
     QMessageBox,
 )
 from PySide6.QtCore import Qt, Signal, Slot, QPoint
@@ -26,6 +27,10 @@ from camera import MindVisionCamera, CameraSettings, CameraSettingRanges
 from processing import (
     WatershedProcessor, OverlayRenderer, SegmentationResult, DistanceResult,
     PICK_OBJECT1, PICK_OBJECT2, SHOW_RESULT,
+)
+from calibration import CalibrationWorker, CalibrationResult
+from detect_lines import (
+    LinesArcsWorker, LinesArcsResult, FeatureDescriptor,
 )
 
 
@@ -173,8 +178,59 @@ class CameraSettingsWindow(QWidget):
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  Processing State
+#  Detection Results Window
 # ════════════════════════════════════════════════════════════════════════
+
+class ResultsWindow(QWidget):
+    """Floating tree view showing detected lines and arcs."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Detection Results")
+        self.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint)
+        self.setMinimumSize(420, 300)
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        self._tree = QTreeWidget()
+        self._tree.setHeaderLabels(["ID", "Category", "Length (mm)", "Angle (°)", "Radius (mm)"])
+        header = self._tree.header()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self._tree.setAlternatingRowColors(True)
+        layout.addWidget(self._tree)
+
+    def update_results(self, result: LinesArcsResult):
+        self._tree.clear()
+
+        lines_item = QTreeWidgetItem(self._tree, ["Lines", "", "", "", ""])
+        lines_item.setExpanded(True)
+        font = lines_item.font(0)
+        font.setBold(True)
+        lines_item.setFont(0, font)
+
+        for lr in result.lines:
+            child = QTreeWidgetItem(lines_item, [
+                lr.id, lr.category,
+                f"{lr.length_mm:.2f}",
+                f"{lr.angle_deg:.1f}",
+                "",
+            ])
+
+        arcs_item = QTreeWidgetItem(self._tree, ["Curves", "", "", "", ""])
+        arcs_item.setExpanded(True)
+        arcs_item.setFont(0, font)
+
+        for ar in result.arcs:
+            child = QTreeWidgetItem(arcs_item, [
+                ar.id, "",
+                "", "",
+                f"{ar.radius_mm:.2f}",
+            ])
 
 class ProcessingState:
     """Holds all mutable state for the current processing image."""
@@ -208,6 +264,9 @@ class MainWindow(QMainWindow):
         self._picker_state: int = PICK_OBJECT1
         self._last_live_frame: np.ndarray | None = None
         self._display_pixmap: QPixmap | None = None  # prevent GC
+        self._calib_pending: bool = False
+        self._active_worker: QThread | None = None
+        self._template_features: list[FeatureDescriptor] | None = None
 
         self._build_ui()
         self._connect_signals()
@@ -250,12 +309,25 @@ class MainWindow(QMainWindow):
         self._save_btn.setEnabled(False)
         toolbar.addWidget(self._save_btn)
 
+        toolbar.addSeparator()
+
+        self._calib_btn = QPushButton("Calibration")
+        self._calib_btn.setEnabled(False)
+        toolbar.addWidget(self._calib_btn)
+
+        self._arclines_btn = QPushButton("Arclines")
+        self._arclines_btn.setEnabled(False)
+        toolbar.addWidget(self._arclines_btn)
+
         # Status bar
         self._status_label = QLabel("No camera connected")
         self.statusBar().addWidget(self._status_label, 1)
 
         # Camera settings window (floating)
         self._settings_window = CameraSettingsWindow(self)
+
+        # Detection results window (floating)
+        self._results_window = ResultsWindow(self)
 
     # ── Signal wiring ───────────────────────────────────────────────
 
@@ -270,6 +342,8 @@ class MainWindow(QMainWindow):
         self._grab_btn.clicked.connect(self._on_grab_clicked)
         self._reset_btn.clicked.connect(self._on_reset)
         self._save_btn.clicked.connect(self._on_save)
+        self._calib_btn.clicked.connect(self._on_calib_clicked)
+        self._arclines_btn.clicked.connect(self._on_arclines_clicked)
 
         # Settings → camera
         self._settings_window.settings_changed.connect(
@@ -285,8 +359,12 @@ class MainWindow(QMainWindow):
 
     @Slot(np.ndarray)
     def _on_grab_frame(self, frame: np.ndarray):
-        """Software-triggered frame received — enter processing."""
-        self._enter_processing_with_image(frame)
+        """Software-triggered frame received — enter processing or calibration."""
+        if self._calib_pending:
+            self._calib_pending = False
+            self._run_calibration(frame)
+        else:
+            self._enter_processing_with_image(frame)
 
     @Slot(str)
     def _on_camera_error(self, msg: str):
@@ -331,10 +409,105 @@ class MainWindow(QMainWindow):
                 self._proc_state.click1,
                 self._proc_state.click2,
                 self._proc_state.result,
+                pixel_size=self._processor.pixel_size,
             )
             path = "distance_result.png"
             cv2.imwrite(path, composited)
             self._status_label.setText(f"Saved to {path}")
+
+    @Slot()
+    def _on_calib_clicked(self):
+        """Capture a chessboard frame and run calibration."""
+        self._calib_pending = True
+        self._status_label.setText("Capturing chessboard frame...")
+        self._camera.software_trigger()
+
+    @Slot()
+    def _on_arclines_clicked(self):
+        """Run line/arc detection on current processing image."""
+        if self._proc_state is None or self._proc_state.image_bgr is None:
+            self._status_label.setText("No image — click Grab first")
+            return
+        self._status_label.setText("Running line/arc detection...")
+        QApplication.processEvents()
+
+        proc_cfg = self._config.get('processing', {})
+        worker = LinesArcsWorker(
+            self._proc_state.image_bgr,
+            self._processor.pixel_size,
+            gauss_sigma=proc_cfg.get('gauss_sigma', 0.4),
+            morph_radius=proc_cfg.get('morph_radius', 3),
+            template=self._template_features,
+        )
+        worker.done.connect(self._on_arclines_done)
+        worker.error.connect(self._on_worker_error)
+        self._active_worker = worker
+        worker.start()
+
+    def _run_calibration(self, frame: np.ndarray):
+        """Launch calibration worker on a grabbed frame."""
+        cal_cfg = self._config.get('calibration', {})
+        self._status_label.setText("Running calibration...")
+        QApplication.processEvents()
+
+        worker = CalibrationWorker(
+            frame,
+            cal_cfg.get('board_cols', 11),
+            cal_cfg.get('board_rows', 8),
+            cal_cfg.get('grid_size_mm', 5.0),
+        )
+        worker.done.connect(self._on_calibration_done)
+        worker.error.connect(self._on_worker_error)
+        self._active_worker = worker
+        worker.start()
+
+    @Slot(object)
+    def _on_calibration_done(self, result: CalibrationResult):
+        """Calibration finished — update pixel_size and config."""
+        self._processor.pixel_size = result.pixel_size_mm
+        self._config['processing']['pixel_size'] = result.pixel_size_mm
+        self._active_worker = None
+        self._status_label.setText(
+            f"Calibrated: {result.pixel_size_mm:.6f} mm/px  "
+            f"(board {result.board_cols}×{result.board_rows}, "
+            f"grid {result.grid_size_mm} mm, "
+            f"mean spacing {result.mean_spacing_px:.2f} px)")
+
+    @Slot(object)
+    def _on_arclines_done(self, result: LinesArcsResult):
+        """Line/arc detection finished — display annotated image and results."""
+        self._active_worker = None
+
+        # Store template from first run
+        if self._template_features is None:
+            descs = []
+            for lr in result.lines:
+                descs.append(FeatureDescriptor(
+                    id=lr.id, centroid_mm=lr.centroid_mm,
+                    primary=lr.angle_deg, secondary=lr.length_mm))
+            for ar in result.arcs:
+                descs.append(FeatureDescriptor(
+                    id=ar.id, centroid_mm=ar.centroid_mm,
+                    primary=ar.radius_mm, secondary=0))
+            self._template_features = descs
+
+        if result.annotated_bgr is not None:
+            self._display_image(result.annotated_bgr)
+
+        self._results_window.update_results(result)
+        self._results_window.show()
+
+        n_lines = len(result.lines)
+        n_arcs = len(result.arcs)
+        self._status_label.setText(
+            f"Detected {n_lines} lines, {n_arcs} arcs  |  "
+            f"Template {'updated' if self._template_features else 'set'}")
+
+    @Slot(str)
+    def _on_worker_error(self, msg: str):
+        """Handle errors from background workers."""
+        self._active_worker = None
+        self._status_label.setText(f"Error: {msg}")
 
     # ── Mode transitions ────────────────────────────────────────────
 
@@ -344,6 +517,8 @@ class MainWindow(QMainWindow):
         self._grab_btn.setEnabled(False)
         self._reset_btn.setEnabled(False)
         self._save_btn.setEnabled(False)
+        self._calib_btn.setEnabled(False)
+        self._arclines_btn.setEnabled(False)
         self._image_label.setCursor(Qt.ArrowCursor)
         self._proc_state = None
         self._camera.set_live_mode()
@@ -355,6 +530,8 @@ class MainWindow(QMainWindow):
         self._grab_btn.setEnabled(True)
         self._reset_btn.setEnabled(True)
         self._save_btn.setEnabled(True)
+        self._calib_btn.setEnabled(True)
+        self._arclines_btn.setEnabled(True)
         self._image_label.setCursor(Qt.CrossCursor)
 
         # Switch camera to trigger mode
@@ -495,6 +672,7 @@ class MainWindow(QMainWindow):
             self._proc_state.click1,
             self._proc_state.click2,
             self._proc_state.result,
+            pixel_size=self._processor.pixel_size,
         )
         self._display_image(composited)
 

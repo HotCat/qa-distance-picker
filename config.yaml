@@ -1,11 +1,11 @@
 camera:
-  exposure_us: 4230
-  gamma: 100
-  contrast: 103
+  exposure_us: 7450
+  gamma: 83
+  contrast: 122
   analog_gain: 1
   ae_enabled: false
   reverse_x: false
-  reverse_y: false
+  reverse_y: true
 processing:
   pixel_size: 0.117027
   gauss_sigma: 0.4
@@ -18,3 +18,7 @@ display:
   contour_thickness: 2
   marker_radius: 6
   line_thickness: 2
+calibration:
+  board_cols: 11
+  board_rows: 8
+  grid_size_mm: 5.0
