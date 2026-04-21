@@ -47,6 +47,7 @@ class LinesArcsResult:
     lines: list[LineResult] = field(default_factory=list)
     arcs: list[ArcResult] = field(default_factory=list)
     arc_grid: dict = field(default_factory=dict)
+    line_grid: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -378,6 +379,122 @@ def _classify_line(angle):
     return "O"
 
 
+# ── Edge-intersection line ID assignment ─────────────────────────────────
+
+_EDGE_ORDER = ['Up', 'Lo', 'Le', 'Ri']
+
+
+def _extend_line_to_edges(p1, p2, img_w, img_h):
+    """Find the two points where the line through p1-p2 meets the image frame.
+
+    Returns a list of (edge_name, x, y) tuples for the two valid intersections.
+    """
+    x1, y1 = float(p1[0]), float(p1[1])
+    x2, y2 = float(p2[0]), float(p2[1])
+    dx, dy = x2 - x1, y2 - y1
+
+    if abs(dx) < 1e-10 and abs(dy) < 1e-10:
+        return []
+
+    hits = []
+    eps = 1e-6
+
+    # Upper edge: y = 0
+    if abs(dy) > eps:
+        t = -y1 / dy
+        x = x1 + t * dx
+        if -eps <= x <= img_w - 1 + eps:
+            hits.append(('Up', x, 0.0))
+
+    # Lower edge: y = img_h - 1
+    if abs(dy) > eps:
+        t = (img_h - 1 - y1) / dy
+        x = x1 + t * dx
+        if -eps <= x <= img_w - 1 + eps:
+            hits.append(('Lo', x, float(img_h - 1)))
+
+    # Left edge: x = 0
+    if abs(dx) > eps:
+        t = -x1 / dx
+        y = y1 + t * dy
+        if -eps <= y <= img_h - 1 + eps:
+            hits.append(('Le', 0.0, y))
+
+    # Right edge: x = img_w - 1
+    if abs(dx) > eps:
+        t = (img_w - 1 - x1) / dx
+        y = y1 + t * dy
+        if -eps <= y <= img_h - 1 + eps:
+            hits.append(('Ri', float(img_w - 1), y))
+
+    # Deduplicate: a line through a corner can produce two hits at the same point
+    seen = set()
+    unique = []
+    for name, x, y in hits:
+        key = (name, round(x, 1), round(y, 1))
+        if key not in seen:
+            seen.add(key)
+            unique.append((name, x, y))
+
+    # Sort by canonical edge order
+    unique.sort(key=lambda h: _EDGE_ORDER.index(h[0]))
+
+    return unique[:2]
+
+
+def _segment_number(pos_mm, segment_mm):
+    """1-indexed segment number for a position along an edge (in mm)."""
+    if segment_mm <= 0:
+        return 1
+    return max(1, int(pos_mm / segment_mm) + (1 if pos_mm % segment_mm > 0 else 0))
+
+
+def _assign_line_ids_by_edges(lines, img_w, img_h, pixel_size_mm,
+                               segment_mm, template_line_grid=None):
+    """Assign line IDs based on which image-edge segments the line crosses.
+
+    Returns:
+        line_grid: dict mapping (edge1, seg1, edge2, seg2) -> (id, angle_deg)
+    """
+    line_grid = {}
+
+    for lr in lines:
+        hits = _extend_line_to_edges(lr.start_px, lr.end_px, img_w, img_h)
+        if len(hits) < 2:
+            lr.id = f"L_unk_{lr.angle_deg:.1f}"
+            continue
+
+        e1_name, e1_x, e1_y = hits[0]
+        e2_name, e2_x, e2_y = hits[1]
+
+        # Segment number: Up/Lo use x_mm, Le/Ri use y_mm
+        if e1_name in ('Up', 'Lo'):
+            s1 = _segment_number(e1_x * pixel_size_mm, segment_mm)
+        else:
+            s1 = _segment_number(e1_y * pixel_size_mm, segment_mm)
+
+        if e2_name in ('Up', 'Lo'):
+            s2 = _segment_number(e2_x * pixel_size_mm, segment_mm)
+        else:
+            s2 = _segment_number(e2_y * pixel_size_mm, segment_mm)
+
+        key = (e1_name, s1, e2_name, s2)
+        angle = lr.angle_deg
+
+        # Try template match
+        if template_line_grid and key in template_line_grid:
+            t_id, t_angle = template_line_grid[key]
+            if abs(angle - t_angle) < 15.0 or abs(angle - t_angle) > 165.0:
+                lr.id = t_id
+                line_grid[key] = (t_id, angle)
+                continue
+
+        lr.id = f"L_{e1_name}{s1}_{e2_name}{s2}_{angle:.1f}"
+        line_grid[key] = (lr.id, angle)
+
+    return line_grid
+
+
 def _estimate_alignment(template_pts, detection_pts):
     """Estimate translation to align detection centroids to template space.
 
@@ -514,9 +631,10 @@ def detect_lines_and_arcs(
     pixel_size_mm: float,
     gauss_sigma: float = 0.4,
     morph_radius: int = 3,
-    template: Optional[list[FeatureDescriptor]] = None,
     grid_size_mm: float = 5.0,
     template_arc_grid: Optional[dict] = None,
+    edge_segment_mm: float = 10.0,
+    template_line_grid: Optional[dict] = None,
 ) -> LinesArcsResult:
     """Detect lines and arcs in an image.
 
@@ -525,9 +643,10 @@ def detect_lines_and_arcs(
         pixel_size_mm: mm per pixel (from calibration or config).
         gauss_sigma: Gaussian smoothing before gradient.
         morph_radius: Closing/Opening radius before watershed.
-        template: If provided, match LINE features to template IDs (Hungarian).
         grid_size_mm: Grid cell size in mm for arc ID assignment.
         template_arc_grid: If provided, match ARC IDs to template grid map.
+        edge_segment_mm: Segment length along image edges in mm for line IDs.
+        template_line_grid: If provided, match LINE IDs to template grid map.
 
     Returns:
         LinesArcsResult with detected lines, arcs, and annotated image.
@@ -593,28 +712,11 @@ def detect_lines_and_arcs(
             centroid_mm=a['center'] * pixel_size_mm,
         ))
 
-    # Assign IDs
-    if template is not None:
-        line_descs = [FeatureDescriptor(
-            id="", centroid_mm=lr.centroid_mm,
-            primary=lr.angle_deg, secondary=lr.length_mm
-        ) for lr in line_results]
-
-        t_lines = [f for f in template if f.id.startswith('L')]
-
-        line_mapping = match_features(t_lines, line_descs)
-        for idx, tid in line_mapping.items():
-            if tid is not None:
-                line_results[idx].id = tid
-
-    # Assign sequential IDs to unmatched lines
-    line_counter = max(
-        (int(lr.id[1:]) for lr in line_results if lr.id.startswith('L')),
-        default=0)
-    for lr in line_results:
-        if not lr.id:
-            line_counter += 1
-            lr.id = f"L{line_counter}"
+    # Assign line IDs via edge intersections
+    img_h, img_w = image_bgr.shape[:2]
+    line_grid = _assign_line_ids_by_edges(
+        line_results, img_w, img_h, pixel_size_mm,
+        edge_segment_mm, template_line_grid)
 
     # Assign arc IDs via grid cells
     arc_grid = _assign_arc_ids_by_grid(arc_results, grid_size_mm, template_arc_grid)
@@ -623,6 +725,7 @@ def detect_lines_and_arcs(
         lines=line_results,
         arcs=arc_results,
         arc_grid=arc_grid,
+        line_grid=line_grid,
     )
 
 
@@ -709,7 +812,12 @@ def render_annotations(
                 p1 = lr.start_px.astype(int)
                 p2 = lr.end_px.astype(int)
                 mid = ((p1 + p2) // 2)
-                arrow_start = (mid + np.array([0, -30])).astype(int)
+                direction = (p2 - p1).astype(float)
+                length = np.linalg.norm(direction)
+                if length > 0:
+                    direction /= length
+                perp = np.array([-direction[1], direction[0]])
+                arrow_start = (mid + (perp * 30)).astype(int)
                 cv2.arrowedLine(canvas, tuple(arrow_start), tuple(mid),
                                 color, 3, tipLength=0.4)
                 cv2.line(canvas, tuple(p1), tuple(p2), color, 3, cv2.LINE_AA)
@@ -728,17 +836,19 @@ class LinesArcsWorker(QThread):
 
     def __init__(self, image_bgr: np.ndarray, pixel_size_mm: float,
                  gauss_sigma: float = 0.4, morph_radius: int = 3,
-                 template: Optional[list[FeatureDescriptor]] = None,
                  grid_size_mm: float = 5.0,
-                 template_arc_grid: Optional[dict] = None):
+                 template_arc_grid: Optional[dict] = None,
+                 edge_segment_mm: float = 10.0,
+                 template_line_grid: Optional[dict] = None):
         super().__init__()
         self._image = image_bgr.copy()
         self._pixel_size_mm = pixel_size_mm
         self._gauss_sigma = gauss_sigma
         self._morph_radius = morph_radius
-        self._template = template
         self._grid_size_mm = grid_size_mm
         self._template_arc_grid = template_arc_grid
+        self._edge_segment_mm = edge_segment_mm
+        self._template_line_grid = template_line_grid
 
     def run(self):
         try:
@@ -746,9 +856,10 @@ class LinesArcsWorker(QThread):
                 self._image, self._pixel_size_mm,
                 gauss_sigma=self._gauss_sigma,
                 morph_radius=self._morph_radius,
-                template=self._template,
                 grid_size_mm=self._grid_size_mm,
                 template_arc_grid=self._template_arc_grid,
+                edge_segment_mm=self._edge_segment_mm,
+                template_line_grid=self._template_line_grid,
             )
             self.done.emit(result)
         except Exception as e:

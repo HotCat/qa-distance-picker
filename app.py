@@ -31,7 +31,7 @@ from processing import (
 )
 from calibration import CalibrationWorker, CalibrationResult
 from detect_lines import (
-    LinesArcsWorker, LinesArcsResult, FeatureDescriptor,
+    LinesArcsWorker, LinesArcsResult,
     render_annotations,
 )
 
@@ -378,7 +378,7 @@ class MainWindow(QMainWindow):
         self._display_pixmap: QPixmap | None = None  # prevent GC
         self._calib_pending: bool = False
         self._active_worker: QThread | None = None
-        self._template_features: list[FeatureDescriptor] | None = None
+        self._template_line_grid: dict | None = None
         self._template_arc_grid: dict | None = None
         self._last_arclines_result: LinesArcsResult | None = None
 
@@ -510,6 +510,7 @@ class MainWindow(QMainWindow):
         self._picker_state = PICK_OBJECT1
         self._last_arclines_result = None
         self._template_arc_grid = None
+        self._template_line_grid = None
         if self._proc_state:
             self._proc_state.obj1_id = None
             self._proc_state.obj2_id = None
@@ -559,9 +560,10 @@ class MainWindow(QMainWindow):
             self._processor.pixel_size,
             gauss_sigma=proc_cfg.get('gauss_sigma', 0.4),
             morph_radius=proc_cfg.get('morph_radius', 3),
-            template=self._template_features,
             grid_size_mm=det_cfg.get('grid_size_mm', 5.0),
             template_arc_grid=self._template_arc_grid,
+            edge_segment_mm=det_cfg.get('edge_segment_mm', 10.0),
+            template_line_grid=self._template_line_grid,
         )
         worker.done.connect(self._on_arclines_done)
         worker.error.connect(self._on_worker_error)
@@ -604,13 +606,8 @@ class MainWindow(QMainWindow):
         self._last_arclines_result = result
 
         # Store template from first run
-        if self._template_features is None:
-            descs = []
-            for lr in result.lines:
-                descs.append(FeatureDescriptor(
-                    id=lr.id, centroid_mm=lr.centroid_mm,
-                    primary=lr.angle_deg, secondary=lr.length_mm))
-            self._template_features = descs
+        if self._template_line_grid is None:
+            self._template_line_grid = result.line_grid
 
         if self._template_arc_grid is None:
             self._template_arc_grid = result.arc_grid
@@ -623,8 +620,7 @@ class MainWindow(QMainWindow):
         n_lines = len(result.lines)
         n_arcs = len(result.arcs)
         self._status_label.setText(
-            f"Detected {n_lines} lines, {n_arcs} arcs  |  "
-            f"Template {'updated' if self._template_features else 'set'}")
+            f"Detected {n_lines} lines, {n_arcs} arcs")
 
     @Slot(str)
     def _on_worker_error(self, msg: str):
@@ -681,6 +677,7 @@ class MainWindow(QMainWindow):
         self._proc_state = None
         self._last_arclines_result = None
         self._template_arc_grid = None
+        self._template_line_grid = None
         self._camera.set_live_mode()
         self._status_label.setText("Live View")
 

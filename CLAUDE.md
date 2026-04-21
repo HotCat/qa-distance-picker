@@ -54,7 +54,7 @@ The application has three decoupled modules with clear boundaries:
 - `camera`: exposure, gamma, contrast, analog gain, AE state, reverse_x (horizontal mirror), reverse_y (vertical mirror) — saved on exit, loaded on startup
 - `processing`: pixel_size (updated by calibration), gauss_sigma, morph_radius, min_region_size (500 px), watershed connectivity/max_depth
 - `calibration`: board_cols (inner corners horizontal), board_rows (inner corners vertical), grid_size_mm (physical grid square size)
-- `detection`: line_min_mm, line_max_mm (line length filter range), arc_min_mm, arc_max_mm (arc radius filter range), grid_size_mm (grid cell size for arc ID assignment)
+- `detection`: line_min_mm, line_max_mm (line length filter range), arc_min_mm, arc_max_mm (arc radius filter range), grid_size_mm (grid cell size for arc ID assignment), edge_segment_mm (segment length along image edges for line ID assignment)
 
 ### `calibration.py` — Chessboard pixel-size calibration
 
@@ -64,11 +64,11 @@ The application has three decoupled modules with clear boundaries:
 
 ### `detect_lines.py` — Line and arc detection with stable ID mapping
 
-- `detect_lines_and_arcs(image_bgr, pixel_size_mm, gauss_sigma, morph_radius, template, grid_size_mm, template_arc_grid)`: full pipeline — DIPlib watershed → LSD line detection (`detect_lines`) + collinear merge → curvature-based arc detection (`detect_arcs_for_object`) per watershed object → `deduplicate_cross_object_arcs` → convert to mm → stable ID assignment → annotated BGR image
-- Line ID matching: `match_features(template, detections)` uses Hungarian algorithm (`scipy.optimize.linear_sum_assignment`) with mean-centroid translation alignment. Lines get IDs `L1, L2, ...`
+- `detect_lines_and_arcs(image_bgr, pixel_size_mm, gauss_sigma, morph_radius, grid_size_mm, template_arc_grid, edge_segment_mm, template_line_grid)`: full pipeline — DIPlib watershed → LSD line detection (`detect_lines`) + collinear merge → curvature-based arc detection (`detect_arcs_for_object`) per watershed object → `deduplicate_cross_object_arcs` → convert to mm → stable ID assignment → annotated BGR image
+- Line ID matching: `_assign_line_ids_by_edges` uses edge-intersection-based assignment. Each line is extended to intersect two image frame edges. The ID encodes which edges and which segments it crosses: `L_{edge1}{seg1}_{edge2}{seg2}_{angle}` (e.g. `L_Up23_Le12_5.3`). Edges ordered as `['Up', 'Lo', 'Le', 'Ri']`. Segment length configurable via `edge_segment_mm`. On subsequent runs, template matching inherits IDs when same edge-intersection key matches with angle within ±15°.
 - Arc ID matching: `_assign_arc_ids_by_grid` uses grid-cell-based assignment. Key = (grid_row, grid_col, int(radius_mm)). Arcs in the same cell with similar radius on subsequent runs inherit the template ID. Configurable grid size (default 5mm). Arcs get IDs like `C5_22_2`
-- Helper functions: `detect_lines` (LSD + merge), `merge_collinear_lines`, `detect_arcs_for_object` (contour → curvature → RANSAC), `deduplicate_cross_object_arcs`, `compute_curvature`, `extract_arc_region`, `ransac_fit_circle`, `solve_circle_from_3_points`
-- Data types: `LineResult` (id, category H/V/D/O, endpoints, length_mm, angle_deg, centroid_mm), `ArcResult` (id, center, radius, centroid_mm), `LinesArcsResult` (includes `arc_grid` dict for template), `FeatureDescriptor`
+- Helper functions: `detect_lines` (LSD + merge), `merge_collinear_lines`, `detect_arcs_for_object` (contour → curvature → RANSAC), `deduplicate_cross_object_arcs`, `compute_curvature`, `extract_arc_region`, `ransac_fit_circle`, `solve_circle_from_3_points`, `_extend_line_to_edges`, `_segment_number`, `_assign_line_ids_by_edges`, `_estimate_alignment`, `match_features`
+- Data types: `LineResult` (id, category H/V/D/O, endpoints, length_mm, angle_deg, centroid_mm), `ArcResult` (id, center, radius, centroid_mm), `LinesArcsResult` (includes `arc_grid` and `line_grid` dicts for template), `FeatureDescriptor`
 - `LinesArcsWorker(QThread)`: runs `detect_lines_and_arcs` in background thread, emits `done(LinesArcsResult)` or `error(str)`
 
 ### `driver/` — MindVision camera SDK
