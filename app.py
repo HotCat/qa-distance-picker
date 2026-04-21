@@ -16,9 +16,9 @@ import numpy as np
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QComboBox,
     QPushButton, QToolBar, QStatusBar, QSlider, QSpinBox,
-    QDoubleSpinBox,
+    QDoubleSpinBox, QTableWidget, QTableWidgetItem,
     QCheckBox, QFormLayout, QGroupBox, QHBoxLayout, QVBoxLayout,
-    QTreeWidget, QTreeWidgetItem, QHeaderView,
+    QTreeWidget, QTreeWidgetItem, QHeaderView, QLineEdit,
     QMessageBox,
 )
 from PySide6.QtCore import Qt, Signal, Slot, QPoint
@@ -31,8 +31,8 @@ from processing import (
 )
 from calibration import CalibrationWorker, CalibrationResult
 from detect_lines import (
-    LinesArcsWorker, LinesArcsResult,
-    render_annotations,
+    LinesArcsWorker, LinesArcsResult, FeaturePair,
+    render_annotations, compute_feature_distance,
 )
 
 
@@ -187,6 +187,7 @@ class ResultsWindow(QWidget):
     """Floating tree view showing detected lines and arcs with filter controls."""
 
     item_selected = Signal(str, str)  # ("line"|"arc", id) or ("", "")
+    pair_added = Signal(str, str, str, str)  # (type_a, id_a, type_b, id_b)
     filters_changed = Signal()
 
     def __init__(self, parent=None):
@@ -196,6 +197,7 @@ class ResultsWindow(QWidget):
         self.setMinimumSize(480, 350)
         self._full_result: LinesArcsResult | None = None
         self._block_filters = False
+        self._block_selection = False
         self._build_ui()
 
     def _build_ui(self):
@@ -261,8 +263,8 @@ class ResultsWindow(QWidget):
         header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self._tree.setAlternatingRowColors(True)
-        self._tree.setSelectionMode(QTreeWidget.SingleSelection)
-        self._tree.currentItemChanged.connect(self._on_selection_changed)
+        self._tree.setSelectionMode(QTreeWidget.ExtendedSelection)
+        self._tree.itemSelectionChanged.connect(self._on_selection_changed)
         layout.addWidget(self._tree)
 
     def _on_filter_changed(self):
@@ -327,22 +329,218 @@ class ResultsWindow(QWidget):
             'arc_max_mm': self._arc_max_spin.value(),
         }
 
-    def _on_selection_changed(self, current, _previous):
-        if current is None or current.parent() is None:
-            self.item_selected.emit("", "")
+    def _on_selection_changed(self):
+        if self._block_selection:
             return
-        item_id = current.text(0)
-        parent_text = current.parent().text(0)
-        if parent_text.startswith("Lines"):
-            self.item_selected.emit("line", item_id)
-        elif parent_text.startswith("Curves"):
-            self.item_selected.emit("arc", item_id)
+        selected = self._tree.selectedItems()
+        leaf_items = [item for item in selected if item.parent() is not None]
+
+        if len(leaf_items) == 2:
+            types_ids = []
+            for item in leaf_items:
+                parent = item.parent().text(0)
+                type_ = "line" if parent.startswith("Lines") else "arc"
+                types_ids.append((type_, item.text(0)))
+            self.pair_added.emit(
+                types_ids[0][0], types_ids[0][1],
+                types_ids[1][0], types_ids[1][1])
+            self._block_selection = True
+            self._tree.clearSelection()
+            self._block_selection = False
+        elif len(leaf_items) == 1:
+            item = leaf_items[0]
+            item_id = item.text(0)
+            parent_text = item.parent().text(0)
+            if parent_text.startswith("Lines"):
+                self.item_selected.emit("line", item_id)
+            elif parent_text.startswith("Curves"):
+                self.item_selected.emit("arc", item_id)
+            else:
+                self.item_selected.emit("", "")
         else:
             self.item_selected.emit("", "")
 
     def update_results(self, result: LinesArcsResult):
         self._full_result = result
         self._apply_filters()
+
+
+class PairListWindow(QWidget):
+    """Floating window with feature pair table and tolerance controls."""
+
+    config_confirmed = Signal(dict)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Feature Pair Measurements")
+        self.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint)
+        self.setMinimumSize(600, 300)
+        self._pairs: list[FeaturePair] = []
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        # Name input
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("Config Name:"))
+        self._name_edit = QLineEdit()
+        self._name_edit.setPlaceholderText("Enter configuration name")
+        name_row.addWidget(self._name_edit)
+        layout.addLayout(name_row)
+
+        # Table
+        self._table = QTableWidget()
+        self._table.setColumnCount(6)
+        self._table.setHorizontalHeaderLabels([
+            "#", "Feature A", "Feature B", "Distance (mm)",
+            "Lower (mm)", "Upper (mm)",
+        ])
+        header = self._table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self._table.setAlternatingRowColors(True)
+        self._table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._table.setSelectionMode(QTableWidget.SingleSelection)
+        layout.addWidget(self._table)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        self._delete_btn = QPushButton("Delete Row")
+        self._delete_btn.clicked.connect(self._on_delete_row)
+        btn_row.addWidget(self._delete_btn)
+        btn_row.addStretch()
+        self._confirm_btn = QPushButton("Confirm")
+        self._confirm_btn.clicked.connect(self._on_confirm)
+        btn_row.addWidget(self._confirm_btn)
+        layout.addLayout(btn_row)
+
+    def add_pair(self, pair: FeaturePair):
+        self._pairs.append(pair)
+        self._refresh_table()
+
+    def _refresh_table(self):
+        self._table.setRowCount(len(self._pairs))
+        for i, pair in enumerate(self._pairs):
+            # Sequence number
+            seq = QTableWidgetItem(str(i + 1))
+            seq.setFlags(seq.flags() & ~Qt.ItemIsEditable)
+            seq.setTextAlignment(Qt.AlignCenter)
+            self._table.setItem(i, 0, seq)
+
+            # Feature IDs (read-only)
+            fa = QTableWidgetItem(f"{pair.type_a[0].upper()}: {pair.id_a}")
+            fa.setFlags(fa.flags() & ~Qt.ItemIsEditable)
+            self._table.setItem(i, 1, fa)
+
+            fb = QTableWidgetItem(f"{pair.type_b[0].upper()}: {pair.id_b}")
+            fb.setFlags(fb.flags() & ~Qt.ItemIsEditable)
+            self._table.setItem(i, 2, fb)
+
+            # Distance (read-only)
+            dist = QTableWidgetItem(f"{pair.distance_mm:.3f}")
+            dist.setFlags(dist.flags() & ~Qt.ItemIsEditable)
+            dist.setTextAlignment(Qt.AlignCenter)
+            self._table.setItem(i, 3, dist)
+
+            # Lower bound (editable)
+            lower = QTableWidgetItem(f"{pair.lower_mm:.3f}")
+            lower.setTextAlignment(Qt.AlignCenter)
+            self._table.setItem(i, 4, lower)
+
+            # Upper bound (editable)
+            upper = QTableWidgetItem(f"{pair.upper_mm:.3f}")
+            upper.setTextAlignment(Qt.AlignCenter)
+            self._table.setItem(i, 5, upper)
+
+        self._table.setRowCount(len(self._pairs))
+
+    def _sync_bounds_from_table(self):
+        """Read edited bound values back into _pairs."""
+        for i, pair in enumerate(self._pairs):
+            lo_item = self._table.item(i, 4)
+            hi_item = self._table.item(i, 5)
+            if lo_item:
+                try:
+                    pair.lower_mm = float(lo_item.text())
+                except ValueError:
+                    pass
+            if hi_item:
+                try:
+                    pair.upper_mm = float(hi_item.text())
+                except ValueError:
+                    pass
+
+    def _on_delete_row(self):
+        row = self._table.currentRow()
+        if 0 <= row < len(self._pairs):
+            self._pairs.pop(row)
+            self._refresh_table()
+
+    def _on_confirm(self):
+        self._sync_bounds_from_table()
+        name = self._name_edit.text().strip() or "unnamed"
+        pairs_data = []
+        for p in self._pairs:
+            pairs_data.append({
+                'type_a': p.type_a, 'id_a': p.id_a,
+                'type_b': p.type_b, 'id_b': p.id_b,
+                'distance_mm': round(p.distance_mm, 4),
+                'lower_mm': round(p.lower_mm, 3),
+                'upper_mm': round(p.upper_mm, 3),
+            })
+        self.config_confirmed.emit({
+            'name': name,
+            'pairs': pairs_data,
+        })
+
+    def update_distances(self, lines, arcs, pixel_size_mm):
+        """Re-compute distances when new detection results arrive."""
+        for pair in self._pairs:
+            dist = compute_feature_distance(
+                pair.type_a, pair.id_a, pair.type_b, pair.id_b,
+                lines, arcs, pixel_size_mm)
+            pair.distance_mm = dist if dist is not None else 0.0
+        self._refresh_table()
+
+    def load_config(self, config_list: list):
+        """Load stored pair configurations from config.yaml."""
+        if not config_list:
+            return
+        # Load the first config entry
+        cfg = config_list[0] if config_list else {}
+        self._name_edit.setText(cfg.get('name', ''))
+        self._pairs.clear()
+        for p in cfg.get('pairs', []):
+            self._pairs.append(FeaturePair(
+                type_a=p.get('type_a', 'line'),
+                id_a=p.get('id_a', ''),
+                type_b=p.get('type_b', 'line'),
+                id_b=p.get('id_b', ''),
+                distance_mm=p.get('distance_mm', 0.0),
+                lower_mm=p.get('lower_mm', 0.0),
+                upper_mm=p.get('upper_mm', 0.0),
+            ))
+        self._refresh_table()
+
+    def get_config_list(self) -> list:
+        """Return current state as a list for yaml.dump."""
+        self._sync_bounds_from_table()
+        name = self._name_edit.text().strip() or "unnamed"
+        pairs_data = []
+        for p in self._pairs:
+            pairs_data.append({
+                'type_a': p.type_a, 'id_a': p.id_a,
+                'type_b': p.type_b, 'id_b': p.id_b,
+                'distance_mm': round(p.distance_mm, 4),
+                'lower_mm': round(p.lower_mm, 3),
+                'upper_mm': round(p.upper_mm, 3),
+            })
+        return [{'name': name, 'pairs': pairs_data}]
 
 class ProcessingState:
     """Holds all mutable state for the current processing image."""
@@ -442,6 +640,10 @@ class MainWindow(QMainWindow):
 
         # Detection results window (floating)
         self._results_window = ResultsWindow(self)
+
+        # Feature pair measurement window (floating)
+        self._pair_list_window = PairListWindow(self)
+
     # ── Signal wiring ───────────────────────────────────────────────
 
     def _connect_signals(self):
@@ -462,11 +664,17 @@ class MainWindow(QMainWindow):
         self._settings_window.settings_changed.connect(
             self._camera.apply_settings)
 
-        # Results window → highlight and filter
+        # Results window → highlight, filter, and pair building
         self._results_window.item_selected.connect(
             self._on_result_item_selected)
+        self._results_window.pair_added.connect(
+            self._on_pair_added)
         self._results_window.filters_changed.connect(
             self._on_filters_changed)
+
+        # Pair list window → config save
+        self._pair_list_window.config_confirmed.connect(
+            self._on_pair_config_confirmed)
 
     # ── Slots: camera frames ────────────────────────────────────────
 
@@ -615,6 +823,10 @@ class MainWindow(QMainWindow):
         self._results_window.update_results(result)
         self._results_window.show()
 
+        # Re-measure stored pairs with new geometry
+        self._pair_list_window.update_distances(
+            result.lines, result.arcs, self._processor.pixel_size)
+
         self._render_arclines()
 
         n_lines = len(result.lines)
@@ -627,6 +839,43 @@ class MainWindow(QMainWindow):
         """Handle errors from background workers."""
         self._active_worker = None
         self._status_label.setText(f"Error: {msg}")
+
+    @Slot(str, str, str, str)
+    def _on_pair_added(self, type_a: str, id_a: str, type_b: str, id_b: str):
+        """Two features Ctrl-selected — compute distance and add to pair list."""
+        result = self._last_arclines_result
+        if result is None:
+            return
+        dist = compute_feature_distance(
+            type_a, id_a, type_b, id_b,
+            result.lines, result.arcs, self._processor.pixel_size)
+        if dist is None:
+            self._status_label.setText(
+                f"Cannot locate features {id_a} / {id_b}")
+            return
+        pair = FeaturePair(
+            type_a=type_a, id_a=id_a,
+            type_b=type_b, id_b=id_b,
+            distance_mm=dist,
+        )
+        self._pair_list_window.add_pair(pair)
+        self._pair_list_window.show()
+        self._status_label.setText(
+            f"Pair added: {id_a} ↔ {id_b} = {dist:.3f} mm")
+
+    def _on_pair_config_confirmed(self, config_dict: dict):
+        """User confirmed pair configuration — save to config.yaml."""
+        self._config['feature_pairs'] = [config_dict]
+        config_path = os.path.join(_app_dir(), 'config.yaml')
+        try:
+            with open(config_path, 'w') as f:
+                yaml.dump(self._config, f, default_flow_style=False,
+                          sort_keys=False)
+            self._status_label.setText(
+                f"Configuration '{config_dict['name']}' saved "
+                f"({len(config_dict['pairs'])} pairs)")
+        except Exception as e:
+            self._status_label.setText(f"Save failed: {e}")
 
     # ── Render pipeline ───────────────────────────────────────────────
 
@@ -893,6 +1142,9 @@ class MainWindow(QMainWindow):
         det_cfg.update(self._results_window.filter_values())
         self._config['detection'] = det_cfg
 
+        # Save feature pair configuration
+        self._config['feature_pairs'] = self._pair_list_window.get_config_list()
+
         config_path = os.path.join(_app_dir(), 'config.yaml')
         try:
             with open(config_path, 'w') as f:
@@ -977,6 +1229,10 @@ def main():
     window._settings_window.show()
     window._results_window.set_filters_from_config(
         config.get('detection', {}))
+
+    # Load stored feature pair configuration
+    window._pair_list_window.load_config(
+        config.get('feature_pairs', []))
 
     sys.exit(app.exec())
 

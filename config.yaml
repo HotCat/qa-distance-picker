@@ -29,3 +29,4 @@ detection:
   arc_max_mm: 6.0
   grid_size_mm: 5.0
   edge_segment_mm: 10.0
+feature_pairs: []

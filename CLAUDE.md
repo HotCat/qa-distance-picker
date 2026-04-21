@@ -28,8 +28,9 @@ The application has three decoupled modules with clear boundaries:
 - Coordinate mapping: `_label_to_image()` reverse-maps QLabel click coordinates to original image pixels accounting for aspect-ratio scaling and centering
 - Config persistence: `_app_dir()` resolves the base directory for config.yaml (exe dir when frozen, source dir otherwise). On first run from a frozen build, the bundled default is extracted from `sys._MEIPASS`. Settings are saved to config.yaml on exit via `closeEvent()`
 - Calibration: `_calib_pending` flag intercepts `grab_done` signal to route grabbed frames to `CalibrationWorker` instead of normal processing. On success, updates `WatershedProcessor.pixel_size` and writes new value to config
-- Arclines: runs `LinesArcsWorker` on the current processing image asynchronously, displays annotated BGR result. Stores line feature descriptors as template on first run for stable ID matching via Hungarian algorithm. Arc IDs use grid-cell-based assignment (key = row, col, radius_bucket) for tolerance to sample drift. Shows results in `ResultsWindow` floating tree view
-- `ResultsWindow`: floating `QTreeWidget` with Lines/Curves top-level items. Filter bar with QDoubleSpinBox controls for line length range (min/max mm) and arc radius range (min/max mm). Emits `item_selected(str, str)` signal on selection change. Clicking a line child highlights it with an arrow at midpoint + thicker line in category color. Clicking an arc child fills the fitted circle with semi-transparent color. Clicking a top-level item or clearing selection removes the highlight. Filter values saved to `config.yaml` under `detection` section
+- Arclines: runs `LinesArcsWorker` on the current processing image asynchronously, displays annotated BGR result. Line IDs use edge-intersection-based assignment. Arc IDs use grid-cell-based assignment. Shows results in `ResultsWindow` floating tree view
+- `ResultsWindow`: floating `QTreeWidget` with Lines/Curves top-level items. ExtendedSelection mode — single-click highlights a feature, Ctrl+click two features adds a pair. Filter bar with QDoubleSpinBox controls for line length range (min/max mm) and arc radius range (min/max mm). Emits `item_selected(str, str)` for single highlight, `pair_added(str, str, str, str)` when 2 features are Ctrl-selected. Filter values saved to `config.yaml` under `detection` section
+- `PairListWindow`: floating window for batch metrology. Shows `QTableWidget` with columns: sequence #, Feature A, Feature B, Distance (mm), Lower bound (mm), Upper bound (mm). Config name `QLineEdit` and Confirm button to save pair configuration to `config.yaml` under `feature_pairs` section. Distances recomputed on each Arclines run using `compute_feature_distance`. Lower/upper bound cells are user-editable. Delete Row button removes selected pair
 
 ### `camera.py` — Camera abstraction (MindVision SDK wrapper)
 
@@ -55,6 +56,7 @@ The application has three decoupled modules with clear boundaries:
 - `processing`: pixel_size (updated by calibration), gauss_sigma, morph_radius, min_region_size (500 px), watershed connectivity/max_depth
 - `calibration`: board_cols (inner corners horizontal), board_rows (inner corners vertical), grid_size_mm (physical grid square size)
 - `detection`: line_min_mm, line_max_mm (line length filter range), arc_min_mm, arc_max_mm (arc radius filter range), grid_size_mm (grid cell size for arc ID assignment), edge_segment_mm (segment length along image edges for line ID assignment)
+- `feature_pairs`: list of saved configurations, each with `name` and `pairs` (list of dicts with type_a, id_a, type_b, id_b, distance_mm, lower_mm, upper_mm)
 
 ### `calibration.py` — Chessboard pixel-size calibration
 
@@ -68,7 +70,8 @@ The application has three decoupled modules with clear boundaries:
 - Line ID matching: `_assign_line_ids_by_edges` uses edge-intersection-based assignment. Each line is extended to intersect two image frame edges. The ID encodes which edges and which segments it crosses: `L_{edge1}{seg1}_{edge2}{seg2}_{angle}` (e.g. `L_Up23_Le12_5.3`). Edges ordered as `['Up', 'Lo', 'Le', 'Ri']`. Segment length configurable via `edge_segment_mm`. On subsequent runs, template matching inherits IDs when same edge-intersection key matches with angle within ±15°.
 - Arc ID matching: `_assign_arc_ids_by_grid` uses grid-cell-based assignment. Key = (grid_row, grid_col, int(radius_mm)). Arcs in the same cell with similar radius on subsequent runs inherit the template ID. Configurable grid size (default 5mm). Arcs get IDs like `C5_22_2`
 - Helper functions: `detect_lines` (LSD + merge), `merge_collinear_lines`, `detect_arcs_for_object` (contour → curvature → RANSAC), `deduplicate_cross_object_arcs`, `compute_curvature`, `extract_arc_region`, `ransac_fit_circle`, `solve_circle_from_3_points`, `_extend_line_to_edges`, `_segment_number`, `_assign_line_ids_by_edges`, `_estimate_alignment`, `match_features`
-- Data types: `LineResult` (id, category H/V/D/O, endpoints, length_mm, angle_deg, centroid_mm), `ArcResult` (id, center, radius, centroid_mm), `LinesArcsResult` (includes `arc_grid` and `line_grid` dicts for template), `FeatureDescriptor`
+- Distance computation: `distance_line_to_line` (minimum segment distance), `distance_arc_to_arc` (center-to-center), `distance_line_to_arc` (center-to-segment), `compute_feature_distance` (dispatch by feature type)
+- Data types: `LineResult` (id, category H/V/D/O, endpoints, length_mm, angle_deg, centroid_mm), `ArcResult` (id, center, radius, centroid_mm), `LinesArcsResult` (includes `arc_grid` and `line_grid` dicts for template), `FeatureDescriptor`, `FeaturePair` (type_a, id_a, type_b, id_b, distance_mm, lower_mm, upper_mm)
 - `LinesArcsWorker(QThread)`: runs `detect_lines_and_arcs` in background thread, emits `done(LinesArcsResult)` or `error(str)`
 
 ### `driver/` — MindVision camera SDK

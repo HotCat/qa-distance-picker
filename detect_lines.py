@@ -51,6 +51,18 @@ class LinesArcsResult:
 
 
 @dataclass
+class FeaturePair:
+    """A pair of features (line/arc) for metrology measurement."""
+    type_a: str          # "line" or "arc"
+    id_a: str            # feature ID from detection
+    type_b: str
+    id_b: str
+    distance_mm: float = 0.0
+    lower_mm: float = 0.0
+    upper_mm: float = 0.0
+
+
+@dataclass
 class FeatureDescriptor:
     """Compact descriptor used for stable ID matching."""
     id: str
@@ -622,6 +634,94 @@ def _assign_arc_ids_by_grid(arcs, grid_size_mm, template_grid=None):
         grid_map[key] = (ar.id, ar.radius_mm)
 
     return grid_map
+
+
+# ── Distance computation for feature pairs ────────────────────────────────
+
+def distance_line_to_line(line1: LineResult, line2: LineResult,
+                          pixel_size_mm: float) -> float:
+    """Minimum distance between two finite line segments in mm."""
+    p1 = line1.start_px.astype(float)
+    p2 = line1.end_px.astype(float)
+    p3 = line2.start_px.astype(float)
+    p4 = line2.end_px.astype(float)
+    d1 = p2 - p1
+    d2 = p4 - p3
+    r = p1 - p3
+
+    a = np.dot(d1, d1)
+    b = np.dot(d1, d2)
+    c = np.dot(d2, d2)
+    d = np.dot(d1, r)
+    e = np.dot(d2, r)
+
+    denom = a * c - b * b
+    if abs(denom) < 1e-10:
+        s = 0.0
+        t = (b * s - e) / c if c > 1e-10 else 0.0
+    else:
+        s = (b * e - c * d) / denom
+        t = (a * e - b * d) / denom
+
+    s = np.clip(s, 0.0, 1.0)
+    t = np.clip(t, 0.0, 1.0)
+
+    closest_p = p1 + s * d1
+    closest_q = p3 + t * d2
+
+    return float(np.linalg.norm(closest_p - closest_q) * pixel_size_mm)
+
+
+def distance_arc_to_arc(arc1: ArcResult, arc2: ArcResult,
+                        pixel_size_mm: float) -> float:
+    """Euclidean distance between circle centers in mm."""
+    return float(np.linalg.norm(arc1.center_px - arc2.center_px) * pixel_size_mm)
+
+
+def distance_line_to_arc(line: LineResult, arc: ArcResult,
+                         pixel_size_mm: float) -> float:
+    """Shortest distance from arc center to line segment in mm."""
+    p1 = line.start_px.astype(float)
+    d = line.end_px.astype(float) - p1
+    length = np.linalg.norm(d)
+    if length < 1e-10:
+        return float(np.linalg.norm(arc.center_px - p1) * pixel_size_mm)
+
+    d_norm = d / length
+    v = arc.center_px.astype(float) - p1
+    t = float(np.dot(v, d_norm))
+    t = max(0.0, min(t, length))
+    closest = p1 + t * d_norm
+    return float(np.linalg.norm(arc.center_px - closest) * pixel_size_mm)
+
+
+def compute_feature_distance(
+    type_a: str, id_a: str, type_b: str, id_b: str,
+    lines: list[LineResult], arcs: list[ArcResult],
+    pixel_size_mm: float,
+) -> float | None:
+    """Compute distance between two features by ID."""
+    line_map = {lr.id: lr for lr in lines}
+    arc_map = {ar.id: ar for ar in arcs}
+
+    def _lookup(ftype, fid):
+        if ftype == "line":
+            return line_map.get(fid)
+        return arc_map.get(fid)
+
+    obj_a = _lookup(type_a, id_a)
+    obj_b = _lookup(type_b, id_b)
+    if obj_a is None or obj_b is None:
+        return None
+
+    if type_a == "line" and type_b == "line":
+        return distance_line_to_line(obj_a, obj_b, pixel_size_mm)
+    if type_a == "arc" and type_b == "arc":
+        return distance_arc_to_arc(obj_a, obj_b, pixel_size_mm)
+    # Mixed: one line, one arc
+    line = obj_a if type_a == "line" else obj_b
+    arc = obj_b if type_b == "arc" else obj_a
+    return distance_line_to_arc(line, arc, pixel_size_mm)
 
 
 # ── Main detection pipeline ────────────────────────────────────────────
