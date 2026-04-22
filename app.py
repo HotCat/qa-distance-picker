@@ -21,8 +21,8 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QHeaderView, QLineEdit,
     QMessageBox,
 )
-from PySide6.QtCore import Qt, Signal, Slot, QPoint
-from PySide6.QtGui import QImage, QPixmap, QKeyEvent
+from PySide6.QtCore import Qt, QThread, Signal, Slot, QPoint
+from PySide6.QtGui import QImage, QPixmap, QKeyEvent, QShortcut, QKeySequence
 
 from camera import MindVisionCamera, CameraSettings, CameraSettingRanges
 from processing import (
@@ -33,6 +33,7 @@ from calibration import CalibrationWorker, CalibrationResult
 from detect_lines import (
     LinesArcsWorker, LinesArcsResult, FeaturePair,
     render_annotations, compute_feature_distance, compute_feature_pair_points,
+    fuzzy_match_template_pairs, detect_lines_and_arcs,
 )
 
 
@@ -366,25 +367,48 @@ class ResultsWindow(QWidget):
 
 
 class PairListWindow(QWidget):
-    """Floating window with feature pair table and tolerance controls."""
+    """Floating window with feature pair table and tolerance controls.
 
-    config_confirmed = Signal(dict)
+    Supports multiple named configurations (templates) for different products.
+    """
+
+    config_confirmed = Signal(list)  # emits full list of configs
     pair_row_selected = Signal(int)  # -1 for no selection, >= 0 for row index
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Feature Pair Measurements")
         self.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint)
-        self.setMinimumSize(600, 300)
-        self._pairs: list[FeaturePair] = []
+        self.setMinimumSize(600, 350)
+        self._all_configs: list[dict] = []  # each: {'name': str, 'pairs': list[FeaturePair]}
+        self._current_index: int = -1  # -1 means new/unsaved config
+        self._block_combo: bool = False
         self._build_ui()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
 
-        # Name input
+        # Config selector row
+        selector_row = QHBoxLayout()
+        selector_row.addWidget(QLabel("Select:"))
+        self._config_combo = QComboBox()
+        self._config_combo.setMinimumWidth(150)
+        self._config_combo.currentIndexChanged.connect(self._on_config_selected)
+        selector_row.addWidget(self._config_combo)
+
+        self._new_btn = QPushButton("New")
+        self._new_btn.clicked.connect(self._on_new_config)
+        selector_row.addWidget(self._new_btn)
+
+        self._delete_config_btn = QPushButton("Delete Config")
+        self._delete_config_btn.clicked.connect(self._on_delete_config)
+        selector_row.addWidget(self._delete_config_btn)
+        selector_row.addStretch()
+        layout.addLayout(selector_row)
+
+        # Name input row
         name_row = QHBoxLayout()
-        name_row.addWidget(QLabel("Config Name:"))
+        name_row.addWidget(QLabel("Name:"))
         self._name_edit = QLineEdit()
         self._name_edit.setPlaceholderText("Enter configuration name")
         name_row.addWidget(self._name_edit)
@@ -392,20 +416,20 @@ class PairListWindow(QWidget):
 
         # Table
         self._table = QTableWidget()
-        self._table.setColumnCount(6)
+        self._table.setColumnCount(5)
         self._table.setHorizontalHeaderLabels([
-            "#", "Feature A", "Feature B", "Distance (mm)",
+            "Feature A", "Feature B", "Distance (mm)",
             "Lower (mm)", "Upper (mm)",
         ])
         header = self._table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(0, QHeaderView.Interactive)
         header.setSectionResizeMode(1, QHeaderView.Interactive)
-        header.setSectionResizeMode(2, QHeaderView.Interactive)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self._table.setColumnWidth(0, 180)
         self._table.setColumnWidth(1, 180)
-        self._table.setColumnWidth(2, 180)
+        self._table.verticalHeader().show()
         self._table.setAlternatingRowColors(True)
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
         self._table.setSelectionMode(QTableWidget.SingleSelection)
@@ -423,7 +447,80 @@ class PairListWindow(QWidget):
         btn_row.addWidget(self._confirm_btn)
         layout.addLayout(btn_row)
 
+    @property
+    def _pairs(self) -> list[FeaturePair]:
+        """Return current config's pairs, or empty list for new config."""
+        if 0 <= self._current_index < len(self._all_configs):
+            return self._all_configs[self._current_index]['pairs']
+        # For new config, return a temporary list stored on the object
+        if not hasattr(self, '_temp_pairs'):
+            self._temp_pairs: list[FeaturePair] = []
+        return self._temp_pairs
+
+    def _on_config_selected(self, index: int):
+        """Combo box selection changed — switch to different config."""
+        if self._block_combo:
+            return
+        # Sync current pairs before switching
+        self._sync_current_config()
+        # Load selected config
+        self._current_index = index
+        if 0 <= index < len(self._all_configs):
+            cfg = self._all_configs[index]
+            self._name_edit.setText(cfg['name'])
+            self._refresh_table()
+        self.pair_row_selected.emit(-1)
+
+    def _on_new_config(self):
+        """Start a new blank configuration."""
+        self._sync_current_config()
+        self._current_index = -1
+        self._temp_pairs: list[FeaturePair] = []
+        self._name_edit.clear()
+        self._block_combo = True
+        self._config_combo.setCurrentIndex(-1)
+        self._block_combo = False
+        self._refresh_table()
+        self.pair_row_selected.emit(-1)
+
+    def _on_delete_config(self):
+        """Delete the currently selected configuration."""
+        if 0 <= self._current_index < len(self._all_configs):
+            name = self._all_configs[self._current_index]['name']
+            self._all_configs.pop(self._current_index)
+            self._refresh_combo()
+            # Select first remaining config or go to new
+            if self._all_configs:
+                self._current_index = 0
+                self._name_edit.setText(self._all_configs[0]['name'])
+                self._refresh_table()
+            else:
+                self._on_new_config()
+            self.pair_row_selected.emit(-1)
+
+    def _sync_current_config(self):
+        """Sync bounds from table into current config's pairs."""
+        self._sync_bounds_from_table()
+        # If we're on an existing config, update it
+        if 0 <= self._current_index < len(self._all_configs):
+            self._all_configs[self._current_index]['pairs'] = self._pairs.copy()
+        # Also update name if different
+        name = self._name_edit.text().strip()
+        if name and 0 <= self._current_index < len(self._all_configs):
+            self._all_configs[self._current_index]['name'] = name
+
+    def _refresh_combo(self):
+        """Repopulate combo box from _all_configs."""
+        self._block_combo = True
+        self._config_combo.clear()
+        for cfg in self._all_configs:
+            self._config_combo.addItem(cfg['name'])
+        if 0 <= self._current_index < len(self._all_configs):
+            self._config_combo.setCurrentIndex(self._current_index)
+        self._block_combo = False
+
     def add_pair(self, pair: FeaturePair):
+        """Add a pair to current config."""
         self._pairs.append(pair)
         self._refresh_table()
 
@@ -434,46 +531,40 @@ class PairListWindow(QWidget):
             self.pair_row_selected.emit(-1)
 
     def _refresh_table(self):
-        self._table.setRowCount(len(self._pairs))
-        for i, pair in enumerate(self._pairs):
-            # Sequence number
-            seq = QTableWidgetItem(str(i + 1))
-            seq.setFlags(seq.flags() & ~Qt.ItemIsEditable)
-            seq.setTextAlignment(Qt.AlignCenter)
-            self._table.setItem(i, 0, seq)
-
+        pairs = self._pairs
+        self._table.setRowCount(len(pairs))
+        for i, pair in enumerate(pairs):
             # Feature IDs (read-only)
             fa = QTableWidgetItem(f"{pair.type_a[0].upper()}: {pair.id_a}")
             fa.setFlags(fa.flags() & ~Qt.ItemIsEditable)
-            self._table.setItem(i, 1, fa)
+            self._table.setItem(i, 0, fa)
 
             fb = QTableWidgetItem(f"{pair.type_b[0].upper()}: {pair.id_b}")
             fb.setFlags(fb.flags() & ~Qt.ItemIsEditable)
-            self._table.setItem(i, 2, fb)
+            self._table.setItem(i, 1, fb)
 
             # Distance (read-only)
             dist = QTableWidgetItem(f"{pair.distance_mm:.3f}")
             dist.setFlags(dist.flags() & ~Qt.ItemIsEditable)
             dist.setTextAlignment(Qt.AlignCenter)
-            self._table.setItem(i, 3, dist)
+            self._table.setItem(i, 2, dist)
 
             # Lower bound (editable)
             lower = QTableWidgetItem(f"{pair.lower_mm:.3f}")
             lower.setTextAlignment(Qt.AlignCenter)
-            self._table.setItem(i, 4, lower)
+            self._table.setItem(i, 3, lower)
 
             # Upper bound (editable)
             upper = QTableWidgetItem(f"{pair.upper_mm:.3f}")
             upper.setTextAlignment(Qt.AlignCenter)
-            self._table.setItem(i, 5, upper)
-
-        self._table.setRowCount(len(self._pairs))
+            self._table.setItem(i, 4, upper)
 
     def _sync_bounds_from_table(self):
-        """Read edited bound values back into _pairs."""
-        for i, pair in enumerate(self._pairs):
-            lo_item = self._table.item(i, 4)
-            hi_item = self._table.item(i, 5)
+        """Read edited bound values back into pairs."""
+        pairs = self._pairs
+        for i, pair in enumerate(pairs):
+            lo_item = self._table.item(i, 3)
+            hi_item = self._table.item(i, 4)
             if lo_item:
                 try:
                     pair.lower_mm = float(lo_item.text())
@@ -486,30 +577,44 @@ class PairListWindow(QWidget):
                     pass
 
     def _on_delete_row(self):
+        """Delete selected row from current config."""
         row = self._table.currentRow()
         if 0 <= row < len(self._pairs):
             self._pairs.pop(row)
             self._refresh_table()
+        self.pair_row_selected.emit(-1)
 
     def _on_confirm(self):
+        """Confirm current config — save/update in _all_configs."""
         self._sync_bounds_from_table()
         name = self._name_edit.text().strip() or "unnamed"
-        pairs_data = []
-        for p in self._pairs:
-            pairs_data.append({
-                'type_a': p.type_a, 'id_a': p.id_a,
-                'type_b': p.type_b, 'id_b': p.id_b,
-                'distance_mm': round(p.distance_mm, 4),
-                'lower_mm': round(p.lower_mm, 3),
-                'upper_mm': round(p.upper_mm, 3),
-            })
-        self.config_confirmed.emit({
-            'name': name,
-            'pairs': pairs_data,
-        })
+        pairs_copy = self._pairs.copy()
+
+        # Find existing config with this name
+        existing_idx = -1
+        for i, cfg in enumerate(self._all_configs):
+            if cfg['name'] == name:
+                existing_idx = i
+                break
+
+        if existing_idx >= 0:
+            # Update existing
+            self._all_configs[existing_idx]['pairs'] = pairs_copy
+            self._current_index = existing_idx
+        else:
+            # Add new
+            self._all_configs.append({'name': name, 'pairs': pairs_copy})
+            self._current_index = len(self._all_configs) - 1
+
+        # Refresh combo and table
+        self._refresh_combo()
+        self._refresh_table()
+
+        # Emit full config list for saving
+        self.config_confirmed.emit(self.get_config_list())
 
     def update_distances(self, lines, arcs, pixel_size_mm):
-        """Re-compute distances when new detection results arrive."""
+        """Re-compute distances for current config when detection results arrive."""
         for pair in self._pairs:
             dist = compute_feature_distance(
                 pair.type_a, pair.id_a, pair.type_b, pair.id_b,
@@ -518,44 +623,294 @@ class PairListWindow(QWidget):
         self._refresh_table()
 
     def load_config(self, config_list: list):
-        """Load stored pair configurations from config.yaml."""
-        if not config_list:
-            return
-        # Load the first config entry
-        cfg = config_list[0] if config_list else {}
-        self._name_edit.setText(cfg.get('name', ''))
-        self._pairs.clear()
-        for p in cfg.get('pairs', []):
-            self._pairs.append(FeaturePair(
-                type_a=p.get('type_a', 'line'),
-                id_a=p.get('id_a', ''),
-                type_b=p.get('type_b', 'line'),
-                id_b=p.get('id_b', ''),
-                distance_mm=p.get('distance_mm', 0.0),
-                lower_mm=p.get('lower_mm', 0.0),
-                upper_mm=p.get('upper_mm', 0.0),
-            ))
-        self._refresh_table()
+        """Load all stored configurations from config.yaml."""
+        self._all_configs.clear()
+        for cfg in config_list:
+            pairs = []
+            for p in cfg.get('pairs', []):
+                pairs.append(FeaturePair(
+                    type_a=p.get('type_a', 'line'),
+                    id_a=p.get('id_a', ''),
+                    type_b=p.get('type_b', 'line'),
+                    id_b=p.get('id_b', ''),
+                    distance_mm=p.get('distance_mm', 0.0),
+                    lower_mm=p.get('lower_mm', 0.0),
+                    upper_mm=p.get('upper_mm', 0.0),
+                ))
+            self._all_configs.append({
+                'name': cfg.get('name', 'unnamed'),
+                'pairs': pairs,
+            })
+        self._refresh_combo()
+        if self._all_configs:
+            self._current_index = 0
+            self._name_edit.setText(self._all_configs[0]['name'])
+            self._refresh_table()
+        else:
+            self._on_new_config()
 
     def get_config_list(self) -> list:
-        """Return current state as a list for yaml.dump."""
-        self._sync_bounds_from_table()
-        name = self._name_edit.text().strip() or "unnamed"
-        pairs_data = []
-        for p in self._pairs:
-            pairs_data.append({
-                'type_a': p.type_a, 'id_a': p.id_a,
-                'type_b': p.type_b, 'id_b': p.id_b,
-                'distance_mm': round(p.distance_mm, 4),
-                'lower_mm': round(p.lower_mm, 3),
-                'upper_mm': round(p.upper_mm, 3),
-            })
-        return [{'name': name, 'pairs': pairs_data}]
+        """Return all configs serialized for yaml.dump."""
+        self._sync_current_config()
+        result = []
+        for cfg in self._all_configs:
+            pairs_data = []
+            for p in cfg['pairs']:
+                pairs_data.append({
+                    'type_a': p.type_a, 'id_a': p.id_a,
+                    'type_b': p.type_b, 'id_b': p.id_b,
+                    'distance_mm': round(p.distance_mm, 4),
+                    'lower_mm': round(p.lower_mm, 3),
+                    'upper_mm': round(p.upper_mm, 3),
+                })
+            result.append({'name': cfg['name'], 'pairs': pairs_data})
+        return result
 
     def get_pair(self, index: int) -> FeaturePair | None:
         if 0 <= index < len(self._pairs):
             return self._pairs[index]
         return None
+
+    def get_config_names(self) -> list[str]:
+        """Return list of all config names for BatchInspect."""
+        return [cfg['name'] for cfg in self._all_configs]
+
+    def get_pairs_for_config(self, name: str) -> list[FeaturePair]:
+        """Return pairs for a named config (for BatchInspect)."""
+        for cfg in self._all_configs:
+            if cfg['name'] == name:
+                return cfg['pairs'].copy()
+        return []
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  Batch Inspect Worker
+# ════════════════════════════════════════════════════════════════════════
+
+class BatchInspectWorker(QThread):
+    """Run detection + fuzzy matching for batch inspection."""
+
+    done = Signal(list)  # list of (distance_mm | None, FeaturePair, pt_a, pt_b)
+    error = Signal(str)
+
+    def __init__(self, image_bgr: np.ndarray, template_pairs: list[FeaturePair],
+                 pixel_size_mm: float, gauss_sigma: float, morph_radius: int,
+                 grid_size_mm: float, segment_mm: float):
+        super().__init__()
+        self._image = image_bgr.copy()
+        self._template_pairs = template_pairs
+        self._pixel_size_mm = pixel_size_mm
+        self._gauss_sigma = gauss_sigma
+        self._morph_radius = morph_radius
+        self._grid_size_mm = grid_size_mm
+        self._segment_mm = segment_mm
+
+    def run(self):
+        try:
+            # Run detection
+            result = detect_lines_and_arcs(
+                self._image, self._pixel_size_mm,
+                gauss_sigma=self._gauss_sigma,
+                morph_radius=self._morph_radius,
+                grid_size_mm=self._grid_size_mm,
+                edge_segment_mm=self._segment_mm,
+            )
+            img_h, img_w = self._image.shape[:2]
+            # Run fuzzy matching
+            matches = fuzzy_match_template_pairs(
+                self._template_pairs,
+                result.lines, result.arcs,
+                img_w, img_h,
+                self._pixel_size_mm,
+                self._segment_mm,
+                self._grid_size_mm,
+            )
+            self.done.emit(matches)
+        except Exception as e:
+            self.error.emit(f"Batch inspect failed: {e}")
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  Batch Inspect Window
+# ════════════════════════════════════════════════════════════════════════
+
+class BatchInspectWindow(QWidget):
+    """Floating window for batch inspection against saved templates."""
+
+    inspect_requested = Signal()  # emitted when user clicks Inspect
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Batch Inspect")
+        self.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint)
+        self.setMinimumSize(550, 350)
+        self._results: list[tuple[float | None, FeaturePair]] = []
+        self._config_pairs: dict[str, list[FeaturePair]] = {}
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        # Template selector
+        selector_row = QHBoxLayout()
+        selector_row.addWidget(QLabel("Template:"))
+        self._template_combo = QComboBox()
+        self._template_combo.setMinimumWidth(150)
+        self._template_combo.currentTextChanged.connect(self._on_template_changed)
+        selector_row.addWidget(self._template_combo)
+        selector_row.addStretch()
+        layout.addLayout(selector_row)
+
+        # Table: #, Feature A, Feature B, Distance, Lower, Upper, Pass?
+        self._table = QTableWidget()
+        self._table.setColumnCount(6)
+        self._table.setHorizontalHeaderLabels([
+            "Feature A", "Feature B", "Distance (mm)",
+            "Lower (mm)", "Upper (mm)", "Pass",
+        ])
+        header = self._table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.Interactive)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self._table.setColumnWidth(0, 180)
+        self._table.setColumnWidth(1, 180)
+        self._table.verticalHeader().show()
+        self._table.setAlternatingRowColors(True)
+        self._table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._table.setSelectionMode(QTableWidget.SingleSelection)
+        layout.addWidget(self._table)
+
+        # Inspect button
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        self._inspect_btn = QPushButton("Inspect")
+        self._inspect_btn.clicked.connect(self._on_inspect_clicked)
+        btn_row.addWidget(self._inspect_btn)
+        layout.addLayout(btn_row)
+
+    def set_config_names(self, configs: dict[str, list[FeaturePair]]):
+        """Populate template combo with available config names and their pairs."""
+        self._config_pairs = configs
+        current = self._template_combo.currentText()
+        self._template_combo.blockSignals(True)
+        self._template_combo.clear()
+        for name in configs:
+            self._template_combo.addItem(name)
+        # Restore selection if possible
+        idx = self._template_combo.findText(current)
+        if idx >= 0:
+            self._template_combo.setCurrentIndex(idx)
+        self._template_combo.blockSignals(False)
+        # Show pairs for current selection
+        self._on_template_changed(self._template_combo.currentText())
+
+    def _on_template_changed(self, name: str):
+        """Template selection changed — show pairs with blank distances."""
+        pairs = self._config_pairs.get(name, [])
+        self._table.setRowCount(len(pairs))
+        for i, pair in enumerate(pairs):
+            fa = QTableWidgetItem(f"{pair.type_a[0].upper()}: {pair.id_a}")
+            fa.setFlags(fa.flags() & ~Qt.ItemIsEditable)
+            self._table.setItem(i, 0, fa)
+
+            fb = QTableWidgetItem(f"{pair.type_b[0].upper()}: {pair.id_b}")
+            fb.setFlags(fb.flags() & ~Qt.ItemIsEditable)
+            self._table.setItem(i, 1, fb)
+
+            dist = QTableWidgetItem("—")
+            dist.setFlags(dist.flags() & ~Qt.ItemIsEditable)
+            dist.setTextAlignment(Qt.AlignCenter)
+            self._table.setItem(i, 2, dist)
+
+            lower = QTableWidgetItem(f"{pair.lower_mm:.3f}")
+            lower.setFlags(lower.flags() & ~Qt.ItemIsEditable)
+            lower.setTextAlignment(Qt.AlignCenter)
+            self._table.setItem(i, 3, lower)
+
+            upper = QTableWidgetItem(f"{pair.upper_mm:.3f}")
+            upper.setFlags(upper.flags() & ~Qt.ItemIsEditable)
+            upper.setTextAlignment(Qt.AlignCenter)
+            self._table.setItem(i, 4, upper)
+
+            pass_item = QTableWidgetItem("—")
+            pass_item.setFlags(pass_item.flags() & ~Qt.ItemIsEditable)
+            pass_item.setTextAlignment(Qt.AlignCenter)
+            self._table.setItem(i, 5, pass_item)
+
+    def get_selected_template(self) -> str:
+        """Return currently selected template name."""
+        return self._template_combo.currentText()
+
+    def _on_inspect_clicked(self):
+        """Notify MainWindow to grab frame and run inspection."""
+        self._inspect_btn.setEnabled(False)
+        self._inspect_btn.setText("Inspecting...")
+        self.inspect_requested.emit()
+
+    def show_results(self, results: list):
+        """Display inspection results in table."""
+        self._results = results
+        self._table.setRowCount(len(results))
+
+        for i, (dist, pair, _pt_a, _pt_b, _det_a, _det_b) in enumerate(results):
+            # Feature IDs
+            fa = QTableWidgetItem(f"{pair.type_a[0].upper()}: {pair.id_a}")
+            fa.setFlags(fa.flags() & ~Qt.ItemIsEditable)
+            self._table.setItem(i, 0, fa)
+
+            fb = QTableWidgetItem(f"{pair.type_b[0].upper()}: {pair.id_b}")
+            fb.setFlags(fb.flags() & ~Qt.ItemIsEditable)
+            self._table.setItem(i, 1, fb)
+
+            # Distance
+            if dist is not None:
+                dist_item = QTableWidgetItem(f"{dist:.3f}")
+            else:
+                dist_item = QTableWidgetItem("N/A")
+            dist_item.setFlags(dist_item.flags() & ~Qt.ItemIsEditable)
+            dist_item.setTextAlignment(Qt.AlignCenter)
+            self._table.setItem(i, 2, dist_item)
+
+            # Lower bound
+            lower = QTableWidgetItem(f"{pair.lower_mm:.3f}")
+            lower.setFlags(lower.flags() & ~Qt.ItemIsEditable)
+            lower.setTextAlignment(Qt.AlignCenter)
+            self._table.setItem(i, 3, lower)
+
+            # Upper bound
+            upper = QTableWidgetItem(f"{pair.upper_mm:.3f}")
+            upper.setFlags(upper.flags() & ~Qt.ItemIsEditable)
+            upper.setTextAlignment(Qt.AlignCenter)
+            self._table.setItem(i, 4, upper)
+
+            # Pass/Fail
+            pass_item = QTableWidgetItem()
+            pass_item.setFlags(pass_item.flags() & ~Qt.ItemIsEditable)
+            pass_item.setTextAlignment(Qt.AlignCenter)
+            if dist is None:
+                pass_item.setText("—")
+            elif pair.lower_mm == 0.0 and pair.upper_mm == 0.0:
+                pass_item.setText("—")  # No tolerance set
+            elif pair.lower_mm <= dist <= pair.upper_mm:
+                pass_item.setText("✓")
+                pass_item.setForeground(Qt.darkGreen)
+            else:
+                pass_item.setText("✗")
+                pass_item.setForeground(Qt.red)
+            self._table.setItem(i, 5, pass_item)
+
+        # Re-enable button
+        self._inspect_btn.setEnabled(True)
+        self._inspect_btn.setText("Inspect")
+
+    def reset_button(self):
+        """Re-enable inspect button after error."""
+        self._inspect_btn.setEnabled(True)
+        self._inspect_btn.setText("Inspect")
+
 
 class ProcessingState:
     """Holds all mutable state for the current processing image."""
@@ -590,6 +945,7 @@ class MainWindow(QMainWindow):
         self._last_live_frame: np.ndarray | None = None
         self._display_pixmap: QPixmap | None = None  # prevent GC
         self._calib_pending: bool = False
+        self._batch_inspect_pending: bool = False
         self._active_worker: QThread | None = None
         self._template_line_grid: dict | None = None
         self._template_arc_grid: dict | None = None
@@ -622,6 +978,10 @@ class MainWindow(QMainWindow):
         self._mode_combo.setMinimumWidth(150)
         toolbar.addWidget(self._mode_combo)
 
+        # Toggle shortcut (works regardless of widget focus)
+        self._toggle_shortcut = QShortcut(QKeySequence(Qt.Key_T), self)
+        self._toggle_shortcut.setContext(Qt.ApplicationShortcut)
+
         toolbar.addSeparator()
 
         self._grab_btn = QPushButton("Grab")
@@ -646,6 +1006,10 @@ class MainWindow(QMainWindow):
         self._arclines_btn.setEnabled(False)
         toolbar.addWidget(self._arclines_btn)
 
+        self._batch_btn = QPushButton("BatchInspect")
+        self._batch_btn.setEnabled(False)
+        toolbar.addWidget(self._batch_btn)
+
         # Status bar
         self._status_label = QLabel("No camera connected")
         self.statusBar().addWidget(self._status_label, 1)
@@ -659,6 +1023,9 @@ class MainWindow(QMainWindow):
         # Feature pair measurement window (floating)
         self._pair_list_window = PairListWindow(self)
 
+        # Batch inspect window (floating)
+        self._batch_inspect_window = BatchInspectWindow(self)
+
     # ── Signal wiring ───────────────────────────────────────────────
 
     def _connect_signals(self):
@@ -669,11 +1036,15 @@ class MainWindow(QMainWindow):
 
         # UI → actions
         self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        self._toggle_shortcut.activated.connect(self._on_toggle_mode)
         self._grab_btn.clicked.connect(self._on_grab_clicked)
         self._reset_btn.clicked.connect(self._on_reset)
         self._save_btn.clicked.connect(self._on_save)
         self._calib_btn.clicked.connect(self._on_calib_clicked)
         self._arclines_btn.clicked.connect(self._on_arclines_clicked)
+        self._batch_btn.clicked.connect(self._on_batch_inspect_clicked)
+        self._batch_inspect_window.inspect_requested.connect(
+            self._on_inspect_requested)
 
         # Settings → camera
         self._settings_window.settings_changed.connect(
@@ -703,10 +1074,13 @@ class MainWindow(QMainWindow):
 
     @Slot(np.ndarray)
     def _on_grab_frame(self, frame: np.ndarray):
-        """Software-triggered frame received — enter processing or calibration."""
+        """Software-triggered frame received — route to calibration, batch inspect, or processing."""
         if self._calib_pending:
             self._calib_pending = False
             self._run_calibration(frame)
+        elif self._batch_inspect_pending:
+            self._batch_inspect_pending = False
+            self._run_batch_inspect(frame)
         else:
             self._enter_processing_with_image(frame)
 
@@ -715,6 +1089,12 @@ class MainWindow(QMainWindow):
         self._status_label.setText(f"Camera error: {msg}")
 
     # ── Slots: mode and buttons ─────────────────────────────────────
+
+    @Slot()
+    def _on_toggle_mode(self):
+        """Toggle between Live View and Image Processing (keyboard shortcut)."""
+        idx = self._mode_combo.currentIndex()
+        self._mode_combo.setCurrentIndex(1 - idx)
 
     @Slot(int)
     def _on_mode_changed(self, index: int):
@@ -815,8 +1195,9 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _on_calibration_done(self, result: CalibrationResult):
         """Calibration finished — update pixel_size and config."""
-        self._processor.pixel_size = result.pixel_size_mm
-        self._config['processing']['pixel_size'] = result.pixel_size_mm
+        px_size = float(result.pixel_size_mm)
+        self._processor.pixel_size = px_size
+        self._config['processing']['pixel_size'] = px_size
         self._active_worker = None
         self._status_label.setText(
             f"Calibrated: {result.pixel_size_mm:.6f} mm/px  "
@@ -857,6 +1238,143 @@ class MainWindow(QMainWindow):
         self._active_worker = None
         self._status_label.setText(f"Error: {msg}")
 
+    # ── Batch inspect ────────────────────────────────────────────────
+
+    @Slot()
+    def _on_batch_inspect_clicked(self):
+        """Open batch inspect window."""
+        configs = {}
+        for cfg in self._pair_list_window._all_configs:
+            configs[cfg['name']] = cfg['pairs']
+        if not configs:
+            self._status_label.setText("No templates saved — create one first")
+            return
+        self._batch_inspect_window.set_config_names(configs)
+        self._batch_inspect_window.show()
+
+    def _on_inspect_requested(self):
+        """User pressed Inspect — refresh config, grab frame and run inspection."""
+        # Refresh template data in case new pairs were added
+        configs = {}
+        for cfg in self._pair_list_window._all_configs:
+            configs[cfg['name']] = cfg['pairs']
+        self._batch_inspect_window.set_config_names(configs)
+        self._status_label.setText("Batch inspect: capturing frame...")
+        self._batch_inspect_pending = True
+        self._camera.software_trigger()
+
+    def _run_batch_inspect(self, frame: np.ndarray):
+        """Run batch inspection on grabbed frame."""
+        # Store the frame as processing state so we can overlay results
+        if frame.ndim == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        elif frame.shape[2] == 1:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        state = ProcessingState()
+        state.image_bgr = frame.copy()
+        state.image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        self._proc_state = state
+        self._last_arclines_result = None  # clear old arclines overlay
+
+        template_name = self._batch_inspect_window.get_selected_template()
+        template_pairs = self._pair_list_window.get_pairs_for_config(template_name)
+        if not template_pairs:
+            self._status_label.setText(
+                f"No pairs in template '{template_name}'")
+            self._batch_inspect_window.reset_button()
+            return
+
+        self._status_label.setText("Running batch inspection...")
+
+        proc_cfg = self._config.get('processing', {})
+        det_cfg = self._config.get('detection', {})
+        worker = BatchInspectWorker(
+            frame,
+            template_pairs,
+            pixel_size_mm=self._processor.pixel_size,
+            gauss_sigma=proc_cfg.get('gauss_sigma', 0.4),
+            morph_radius=proc_cfg.get('morph_radius', 3),
+            grid_size_mm=det_cfg.get('grid_size_mm', 5.0),
+            segment_mm=det_cfg.get('edge_segment_mm', 10.0),
+        )
+        worker.done.connect(self._on_batch_inspect_done)
+        worker.error.connect(self._on_batch_inspect_error)
+        self._active_worker = worker
+        worker.start()
+
+    @Slot(list)
+    def _on_batch_inspect_done(self, results: list):
+        """Batch inspection finished — show results and overlay on frame."""
+        self._active_worker = None
+        self._batch_inspect_window.show_results(results)
+
+        # Render feature geometry + measurement overlays on current frame
+        if self._proc_state and self._proc_state.image_bgr is not None:
+            from detect_lines import (render_measurement_overlay, LineResult,
+                                      ArcResult)
+            canvas = self._proc_state.image_bgr.copy()
+            font = cv2.FONT_HERSHEY_SIMPLEX
+
+            # Draw detected feature geometry first (lines and arcs)
+            for dist, pair, pt_a, pt_b, det_a, det_b in results:
+                if det_a is None and det_b is None:
+                    continue
+                # Color: green if pass, red if fail, yellow if no tolerance
+                if pair.lower_mm == 0 and pair.upper_mm == 0:
+                    feat_color = (0, 255, 255)  # yellow
+                elif dist is not None and pair.lower_mm <= dist <= pair.upper_mm:
+                    feat_color = (0, 200, 0)  # green
+                else:
+                    feat_color = (0, 0, 255)  # red
+
+                for det in (det_a, det_b):
+                    if det is None:
+                        continue
+                    if isinstance(det, LineResult):
+                        p1 = det.start_px.astype(int)
+                        p2 = det.end_px.astype(int)
+                        cv2.line(canvas, tuple(p1), tuple(p2), feat_color, 2, cv2.LINE_AA)
+                        cv2.circle(canvas, tuple(p1), 4, feat_color, -1)
+                        cv2.circle(canvas, tuple(p2), 4, feat_color, -1)
+                    elif isinstance(det, ArcResult):
+                        cx, cy = int(det.center_px[0]), int(det.center_px[1])
+                        r = int(det.radius_px)
+                        cv2.circle(canvas, (cx, cy), r, feat_color, 2, cv2.LINE_AA)
+                        cv2.circle(canvas, (cx, cy), 3, feat_color, -1)
+
+            # Draw measurement lines on top
+            for dist, pair, pt_a, pt_b, det_a, det_b in results:
+                if dist is not None and pt_a is not None and pt_b is not None:
+                    if pair.lower_mm == 0 and pair.upper_mm == 0:
+                        color = (0, 255, 255)
+                    elif pair.lower_mm <= dist <= pair.upper_mm:
+                        color = (0, 200, 0)
+                    else:
+                        color = (0, 0, 255)
+                    render_measurement_overlay(canvas, pt_a, pt_b, dist, color)
+            self._display_image(canvas)
+
+        n_pass = sum(1 for dist, pair, _, _, _, _ in results
+                     if dist is not None
+                     and not (pair.lower_mm == 0 and pair.upper_mm == 0)
+                     and pair.lower_mm <= dist <= pair.upper_mm)
+        n_total = len(results)
+        n_measured = sum(1 for dist, _, _, _, _, _ in results if dist is not None)
+        n_fail = sum(1 for dist, pair, _, _, _, _ in results
+                     if dist is not None
+                     and not (pair.lower_mm == 0 and pair.upper_mm == 0)
+                     and not (pair.lower_mm <= dist <= pair.upper_mm))
+        self._status_label.setText(
+            f"Batch inspect done: {n_measured}/{n_total} measured, "
+            f"{n_pass} pass, {n_fail} fail")
+
+    @Slot(str)
+    def _on_batch_inspect_error(self, msg: str):
+        """Batch inspection failed."""
+        self._active_worker = None
+        self._status_label.setText(f"Batch inspect error: {msg}")
+        self._batch_inspect_window.reset_button()
+
     @Slot(str, str, str, str)
     def _on_pair_added(self, type_a: str, id_a: str, type_b: str, id_b: str):
         """Two features Ctrl-selected — compute distance and add to pair list."""
@@ -880,17 +1398,16 @@ class MainWindow(QMainWindow):
         self._status_label.setText(
             f"Pair added: {id_a} ↔ {id_b} = {dist:.3f} mm")
 
-    def _on_pair_config_confirmed(self, config_dict: dict):
-        """User confirmed pair configuration — save to config.yaml."""
-        self._config['feature_pairs'] = [config_dict]
+    def _on_pair_config_confirmed(self, configs: list):
+        """User confirmed pair configuration — save all configs to config.yaml."""
+        self._config['feature_pairs'] = configs
         config_path = os.path.join(_app_dir(), 'config.yaml')
         try:
             with open(config_path, 'w') as f:
                 yaml.dump(self._config, f, default_flow_style=False,
                           sort_keys=False)
             self._status_label.setText(
-                f"Configuration '{config_dict['name']}' saved "
-                f"({len(config_dict['pairs'])} pairs)")
+                f"Saved {len(configs)} configuration(s)")
         except Exception as e:
             self._status_label.setText(f"Save failed: {e}")
 
@@ -962,6 +1479,7 @@ class MainWindow(QMainWindow):
         self._save_btn.setEnabled(False)
         self._calib_btn.setEnabled(False)
         self._arclines_btn.setEnabled(False)
+        self._batch_btn.setEnabled(False)
         self._image_label.setCursor(Qt.ArrowCursor)
         self._proc_state = None
         self._last_arclines_result = None
@@ -978,6 +1496,7 @@ class MainWindow(QMainWindow):
         self._save_btn.setEnabled(True)
         self._calib_btn.setEnabled(True)
         self._arclines_btn.setEnabled(True)
+        self._batch_btn.setEnabled(True)
         self._image_label.setCursor(Qt.CrossCursor)
 
         # Switch camera to trigger mode

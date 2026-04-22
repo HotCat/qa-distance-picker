@@ -743,6 +743,273 @@ def compute_feature_pair_points(
     return distance_line_to_arc(line, arc, pixel_size_mm)
 
 
+# ── Fuzzy ID matching for batch inspection ────────────────────────────────
+
+import re
+
+# Regex patterns for parsing IDs
+_LINE_ID_RE = re.compile(
+    r'^L_([A-Z][a-z])(\d+)_([A-Z][a-z])(\d+)_(\d+\.?\d*)_(\d+\.?\d*)$')
+_ARC_ID_RE = re.compile(r'^C(\d+)_(\d+)_(\d+)$')
+
+
+def parse_line_id(line_id: str) -> dict | None:
+    """Parse a line ID string into components.
+
+    Args:
+        line_id: e.g. "L_Up8_Lo7_90.4_76.60"
+
+    Returns:
+        dict with keys: edge1, seg1, edge2, seg2, angle, length
+        or None if parse fails.
+    """
+    m = _LINE_ID_RE.match(line_id)
+    if not m:
+        return None
+    return {
+        'edge1': m.group(1),
+        'seg1': int(m.group(2)),
+        'edge2': m.group(3),
+        'seg2': int(m.group(4)),
+        'angle': float(m.group(5)),
+        'length': float(m.group(6)),
+    }
+
+
+def parse_arc_id(arc_id: str) -> dict | None:
+    """Parse an arc ID string into components.
+
+    Args:
+        arc_id: e.g. "C4_13_4"
+
+    Returns:
+        dict with keys: row, col, radius_bucket
+        or None if parse fails.
+    """
+    m = _ARC_ID_RE.match(arc_id)
+    if not m:
+        return None
+    return {
+        'row': int(m.group(1)),
+        'col': int(m.group(2)),
+        'radius_bucket': int(m.group(3)),
+    }
+
+
+def _score_line_match(template: dict, detected: LineResult,
+                      img_w: int, img_h: int, pixel_size_mm: float,
+                      segment_mm: float) -> float:
+    """Score how well a detected line matches a parsed template.
+
+    Lower score = better match. Returns infinity for impossible matches.
+
+    Scoring weights:
+    - Edge pair must match exactly (otherwise infinity)
+    - Segment distance: weight 10 per segment difference
+    - Angle difference: weight 2 per degree (tolerance ~5°)
+    - Length ratio: weight 50 per 100% difference (tolerance ~15%)
+    """
+    # Compute detected line's edge intersections
+    hits = _extend_line_to_edges(detected.start_px, detected.end_px, img_w, img_h)
+    if len(hits) < 2:
+        return float('inf')
+
+    # Sort detected edges by canonical order for comparison
+    det_edges = sorted([hits[0][0], hits[1][0]], key=lambda e: _EDGE_ORDER.index(e))
+    tmpl_edges = sorted([template['edge1'], template['edge2']], key=lambda e: _EDGE_ORDER.index(e))
+
+    # Edge pair must match
+    if det_edges != tmpl_edges:
+        return float('inf')
+
+    # Compute detected segment numbers
+    def seg_num(hit):
+        name, x, y = hit
+        if name in ('Up', 'Lo'):
+            return _segment_number(x * pixel_size_mm, segment_mm)
+        return _segment_number(y * pixel_size_mm, segment_mm)
+
+    det_seg1 = seg_num(hits[0])
+    det_seg2 = seg_num(hits[1])
+
+    # Map detected segments to template segments by edge name
+    tmpl_seg_map = {template['edge1']: template['seg1'], template['edge2']: template['seg2']}
+    det_seg_map = {hits[0][0]: det_seg1, hits[1][0]: det_seg2}
+
+    seg_dist = 0
+    for edge in tmpl_seg_map:
+        if edge in det_seg_map:
+            seg_dist += abs(det_seg_map[edge] - tmpl_seg_map[edge])
+
+    # Angle difference (handle wrap-around)
+    angle_d = abs(detected.angle_deg - template['angle']) % 180
+    angle_d = min(angle_d, 180 - angle_d)
+
+    # Length ratio
+    if template['length'] > 1:
+        length_ratio = abs(detected.length_mm - template['length']) / template['length']
+    else:
+        length_ratio = abs(detected.length_mm - template['length'])
+
+    # Combined score
+    score = seg_dist * 10 + angle_d * 2 + length_ratio * 50
+    return score
+
+
+def _score_arc_match(template: dict, detected: ArcResult,
+                     grid_size_mm: float) -> float:
+    """Score how well a detected arc matches a parsed template.
+
+    Scoring weights:
+    - Grid cell distance: weight 10 per cell
+    - Radius bucket difference: weight 5 per bucket
+    """
+    # Compute detected arc's grid cell
+    det_row = int(detected.centroid_mm[1] // grid_size_mm)
+    det_col = int(detected.centroid_mm[0] // grid_size_mm)
+    det_bucket = int(detected.radius_mm)
+
+    grid_dist = abs(det_row - template['row']) + abs(det_col - template['col'])
+    radius_diff = abs(det_bucket - template['radius_bucket'])
+
+    score = grid_dist * 10 + radius_diff * 5
+    return score
+
+
+def fuzzy_match_template_pairs(
+    template_pairs: list[FeaturePair],
+    detected_lines: list[LineResult],
+    detected_arcs: list[ArcResult],
+    img_w: int, img_h: int,
+    pixel_size_mm: float,
+    segment_mm: float,
+    grid_size_mm: float,
+) -> list[tuple[float | None, FeaturePair]]:
+    """Match template pair IDs to detected features using fuzzy matching.
+
+    Uses Hungarian assignment for 1-to-1 matching between template features
+    and detected features, ensuring each detected feature matches at most one
+    template feature.
+
+    Args:
+        template_pairs: List of FeaturePair from a saved template.
+        detected_lines: List of LineResult from detection.
+        detected_arcs: List of ArcResult from detection.
+        img_w, img_h: Image dimensions.
+        pixel_size_mm: mm per pixel.
+        segment_mm: Edge segment size in mm.
+        grid_size_mm: Grid cell size in mm.
+
+    Returns:
+        List of (distance_mm_or_None, updated_pair, pt_a_px_or_None, pt_b_px_or_None,
+                  det_a_or_None, det_b_or_None) for each template pair.
+        det_a/det_b are the matched LineResult or ArcResult objects.
+        updated_pair has distance_mm filled in; None if matching failed.
+    """
+    if not template_pairs:
+        return []
+
+    # Collect all unique template feature IDs with their types
+    template_features = {}  # (type, id) -> parsed dict or None
+    for pair in template_pairs:
+        key_a = (pair.type_a, pair.id_a)
+        key_b = (pair.type_b, pair.id_b)
+        if key_a not in template_features:
+            if pair.type_a == 'line':
+                template_features[key_a] = parse_line_id(pair.id_a)
+            else:
+                template_features[key_a] = parse_arc_id(pair.id_a)
+        if key_b not in template_features:
+            if pair.type_b == 'line':
+                template_features[key_b] = parse_line_id(pair.id_b)
+            else:
+                template_features[key_b] = parse_arc_id(pair.id_b)
+
+    # Separate lines and arcs
+    tmpl_lines = [(k, v) for k, v in template_features.items() if k[0] == 'line']
+    tmpl_arcs = [(k, v) for k, v in template_features.items() if k[0] == 'arc']
+
+    # Build cost matrix for lines
+    line_assignment = {}
+    if tmpl_lines and detected_lines:
+        n_tmpl = len(tmpl_lines)
+        n_det = len(detected_lines)
+        cost = np.full((n_tmpl, n_det), 1e9)
+
+        for i, (key, parsed) in enumerate(tmpl_lines):
+            if parsed is None:
+                continue
+            for j, det in enumerate(detected_lines):
+                score = _score_line_match(parsed, det, img_w, img_h,
+                                          pixel_size_mm, segment_mm)
+                cost[i, j] = score
+
+        row_ind, col_ind = linear_sum_assignment(cost)
+        for r, c in zip(row_ind, col_ind):
+            if cost[r, c] < 1e8:  # reasonable threshold
+                line_assignment[tmpl_lines[r][0]] = detected_lines[c]
+
+    # Build cost matrix for arcs
+    arc_assignment = {}
+    if tmpl_arcs and detected_arcs:
+        n_tmpl = len(tmpl_arcs)
+        n_det = len(detected_arcs)
+        cost = np.full((n_tmpl, n_det), 1e9)
+
+        for i, (key, parsed) in enumerate(tmpl_arcs):
+            if parsed is None:
+                continue
+            for j, det in enumerate(detected_arcs):
+                score = _score_arc_match(parsed, det, grid_size_mm)
+                cost[i, j] = score
+
+        row_ind, col_ind = linear_sum_assignment(cost)
+        for r, c in zip(row_ind, col_ind):
+            if cost[r, c] < 1e8:
+                arc_assignment[tmpl_arcs[r][0]] = detected_arcs[c]
+
+    # Compute distances for each template pair
+    results = []
+    for pair in template_pairs:
+        key_a = (pair.type_a, pair.id_a)
+        key_b = (pair.type_b, pair.id_b)
+
+        det_a = line_assignment.get(key_a) or arc_assignment.get(key_a)
+        det_b = line_assignment.get(key_b) or arc_assignment.get(key_b)
+
+        if det_a is None or det_b is None:
+            results.append((None, pair, None, None, None, None))
+            continue
+
+        # Compute distance using the appropriate function
+        if pair.type_a == 'line' and pair.type_b == 'line':
+            dist, pt_a, pt_b = distance_line_to_line(det_a, det_b, pixel_size_mm)
+        elif pair.type_a == 'arc' and pair.type_b == 'arc':
+            dist, pt_a, pt_b = distance_arc_to_arc(det_a, det_b, pixel_size_mm)
+        else:
+            # Mixed
+            line = det_a if pair.type_a == 'line' else det_b
+            arc = det_b if pair.type_b == 'arc' else det_a
+            dist, pt_line, pt_arc = distance_line_to_arc(line, arc, pixel_size_mm)
+            # Map points back to pair order
+            if pair.type_a == 'line':
+                pt_a, pt_b = pt_line, pt_arc
+            else:
+                pt_a, pt_b = pt_arc, pt_line
+
+        # Update the pair with computed distance
+        updated = FeaturePair(
+            type_a=pair.type_a, id_a=pair.id_a,
+            type_b=pair.type_b, id_b=pair.id_b,
+            distance_mm=dist,
+            lower_mm=pair.lower_mm,
+            upper_mm=pair.upper_mm,
+        )
+        results.append((dist, updated, pt_a, pt_b, det_a, det_b))
+
+    return results
+
+
 # ── Main detection pipeline ────────────────────────────────────────────
 
 def detect_lines_and_arcs(
