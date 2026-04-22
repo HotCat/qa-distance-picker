@@ -465,15 +465,18 @@ def _assign_line_ids_by_edges(lines, img_w, img_h, pixel_size_mm,
                                segment_mm, template_line_grid=None):
     """Assign line IDs based on which image-edge segments the line crosses.
 
+    Key includes length bucket so parallel lines at different positions
+    get unique IDs.
+
     Returns:
-        line_grid: dict mapping (edge1, seg1, edge2, seg2) -> (id, angle_deg)
+        line_grid: dict mapping (edge1, seg1, edge2, seg2, len_bucket) -> (id, angle_deg)
     """
     line_grid = {}
 
     for lr in lines:
         hits = _extend_line_to_edges(lr.start_px, lr.end_px, img_w, img_h)
         if len(hits) < 2:
-            lr.id = f"L_unk_{lr.angle_deg:.1f}"
+            lr.id = f"L_unk_{lr.angle_deg:.1f}_{lr.length_mm:.2f}"
             continue
 
         e1_name, e1_x, e1_y = hits[0]
@@ -490,7 +493,8 @@ def _assign_line_ids_by_edges(lines, img_w, img_h, pixel_size_mm,
         else:
             s2 = _segment_number(e2_y * pixel_size_mm, segment_mm)
 
-        key = (e1_name, s1, e2_name, s2)
+        len_bucket = round(lr.length_mm, 1)
+        key = (e1_name, s1, e2_name, s2, len_bucket)
         angle = lr.angle_deg
 
         # Try template match
@@ -501,7 +505,7 @@ def _assign_line_ids_by_edges(lines, img_w, img_h, pixel_size_mm,
                 line_grid[key] = (t_id, angle)
                 continue
 
-        lr.id = f"L_{e1_name}{s1}_{e2_name}{s2}_{angle:.1f}"
+        lr.id = f"L_{e1_name}{s1}_{e2_name}{s2}_{angle:.1f}_{lr.length_mm:.2f}"
         line_grid[key] = (lr.id, angle)
 
     return line_grid
