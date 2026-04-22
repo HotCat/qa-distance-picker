@@ -638,61 +638,61 @@ def _assign_arc_ids_by_grid(arcs, grid_size_mm, template_grid=None):
 
 # ── Distance computation for feature pairs ────────────────────────────────
 
+def _perpendicular_foot_to_line(point, line_start, line_end):
+    """Project a point onto the infinite line through line_start→line_end.
+
+    Returns the foot of the perpendicular (on the extended line, not clamped).
+    """
+    d = line_end - line_start
+    length_sq = np.dot(d, d)
+    if length_sq < 1e-10:
+        return line_start.copy()
+    t = np.dot(point - line_start, d) / length_sq
+    return line_start + t * d
+
+
 def distance_line_to_line(line1: LineResult, line2: LineResult,
-                          pixel_size_mm: float) -> float:
-    """Minimum distance between two finite line segments in mm."""
-    p1 = line1.start_px.astype(float)
-    p2 = line1.end_px.astype(float)
-    p3 = line2.start_px.astype(float)
-    p4 = line2.end_px.astype(float)
-    d1 = p2 - p1
-    d2 = p4 - p3
-    r = p1 - p3
+                          pixel_size_mm: float) -> tuple[float, np.ndarray, np.ndarray]:
+    """Perpendicular distance from center of line1 to line2 (extended if needed).
 
-    a = np.dot(d1, d1)
-    b = np.dot(d1, d2)
-    c = np.dot(d2, d2)
-    d = np.dot(d1, r)
-    e = np.dot(d2, r)
+    Finds the midpoint of line1, draws a perpendicular through it, and finds
+    the intersection with line2 (extended beyond its endpoints if necessary).
+    Distance is from the midpoint of line1 to that intersection point.
 
-    denom = a * c - b * b
-    if abs(denom) < 1e-10:
-        s = 0.0
-        t = (b * s - e) / c if c > 1e-10 else 0.0
-    else:
-        s = (b * e - c * d) / denom
-        t = (a * e - b * d) / denom
-
-    s = np.clip(s, 0.0, 1.0)
-    t = np.clip(t, 0.0, 1.0)
-
-    closest_p = p1 + s * d1
-    closest_q = p3 + t * d2
-
-    return float(np.linalg.norm(closest_p - closest_q) * pixel_size_mm)
+    Returns:
+        (distance_mm, midpoint_of_line1, intersection_on_line2) in pixel coordinates.
+    """
+    mid = (line1.start_px + line1.end_px).astype(float) / 2.0
+    intersect = _perpendicular_foot_to_line(mid, line2.start_px.astype(float),
+                                            line2.end_px.astype(float))
+    return float(np.linalg.norm(mid - intersect) * pixel_size_mm), mid, intersect
 
 
 def distance_arc_to_arc(arc1: ArcResult, arc2: ArcResult,
-                        pixel_size_mm: float) -> float:
-    """Euclidean distance between circle centers in mm."""
-    return float(np.linalg.norm(arc1.center_px - arc2.center_px) * pixel_size_mm)
+                        pixel_size_mm: float) -> tuple[float, np.ndarray, np.ndarray]:
+    """Euclidean distance between circle centers in mm.
+
+    Returns:
+        (distance_mm, center1_px, center2_px).
+    """
+    return (float(np.linalg.norm(arc1.center_px - arc2.center_px) * pixel_size_mm),
+            arc1.center_px.copy(), arc2.center_px.copy())
 
 
 def distance_line_to_arc(line: LineResult, arc: ArcResult,
-                         pixel_size_mm: float) -> float:
-    """Shortest distance from arc center to line segment in mm."""
-    p1 = line.start_px.astype(float)
-    d = line.end_px.astype(float) - p1
-    length = np.linalg.norm(d)
-    if length < 1e-10:
-        return float(np.linalg.norm(arc.center_px - p1) * pixel_size_mm)
+                         pixel_size_mm: float) -> tuple[float, np.ndarray, np.ndarray]:
+    """Perpendicular distance from arc center to the line (extended if needed).
 
-    d_norm = d / length
-    v = arc.center_px.astype(float) - p1
-    t = float(np.dot(v, d_norm))
-    t = max(0.0, min(t, length))
-    closest = p1 + t * d_norm
-    return float(np.linalg.norm(arc.center_px - closest) * pixel_size_mm)
+    Drops a perpendicular from the arc center to the infinite line through
+    the line segment endpoints (extended beyond endpoints if necessary).
+
+    Returns:
+        (distance_mm, foot_of_perpendicular_px, arc_center_px).
+    """
+    foot = _perpendicular_foot_to_line(arc.center_px.astype(float),
+                                       line.start_px.astype(float),
+                                       line.end_px.astype(float))
+    return float(np.linalg.norm(arc.center_px - foot) * pixel_size_mm), foot, arc.center_px.copy()
 
 
 def compute_feature_distance(
@@ -701,6 +701,21 @@ def compute_feature_distance(
     pixel_size_mm: float,
 ) -> float | None:
     """Compute distance between two features by ID."""
+    result = compute_feature_pair_points(
+        type_a, id_a, type_b, id_b, lines, arcs, pixel_size_mm)
+    return result[0] if result is not None else None
+
+
+def compute_feature_pair_points(
+    type_a: str, id_a: str, type_b: str, id_b: str,
+    lines: list[LineResult], arcs: list[ArcResult],
+    pixel_size_mm: float,
+) -> tuple[float, np.ndarray, np.ndarray] | None:
+    """Compute distance and geometry points between two features by ID.
+
+    Returns:
+        (distance_mm, point_a_px, point_b_px) or None if features not found.
+    """
     line_map = {lr.id: lr for lr in lines}
     arc_map = {ar.id: ar for ar in arcs}
 
@@ -838,12 +853,65 @@ ARC_PALETTE = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
                (255, 0, 255), (0, 255, 255), (128, 255, 0), (255, 128, 0)]
 
 
+def render_measurement_overlay(
+    canvas: np.ndarray,
+    pt1: np.ndarray,
+    pt2: np.ndarray,
+    distance_mm: float,
+    color: tuple = (0, 0, 255),
+) -> None:
+    """Draw a measurement line between two points with mm label.
+
+    Args:
+        canvas: BGR image to draw on (modified in-place).
+        pt1: First point in pixel coordinates.
+        pt2: Second point in pixel coordinates.
+        distance_mm: Distance to display.
+        color: Line color (default red).
+    """
+    pt1_int = pt1.astype(int)
+    pt2_int = pt2.astype(int)
+
+    cv2.line(canvas, tuple(pt1_int), tuple(pt2_int), color, 2, cv2.LINE_AA)
+    cv2.circle(canvas, tuple(pt1_int), 5, color, -1)
+    cv2.circle(canvas, tuple(pt2_int), 5, color, -1)
+
+    mid = ((pt1_int + pt2_int) // 2).astype(int)
+    direction = (pt2_int - pt1_int).astype(float)
+    length = np.linalg.norm(direction)
+    if length > 0:
+        direction = direction / length
+    perp = np.array([-direction[1], direction[0]])
+
+    label = f"{distance_mm:.3f} mm"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, th), _ = cv2.getTextSize(label, font, 0.5, 1)
+
+    offset = (perp * 15).astype(int)
+    tx, ty = mid[0] + offset[0], mid[1] + offset[1]
+
+    if tx - tw // 2 < 0:
+        tx = tw // 2 + 2
+    elif tx + tw // 2 > canvas.shape[1]:
+        tx = canvas.shape[1] - tw // 2 - 2
+    if ty - th < 0:
+        ty = th + 10
+    elif ty > canvas.shape[0]:
+        ty = canvas.shape[0] - 5
+
+    cv2.rectangle(canvas, (tx - tw // 2 - 3, ty - th - 3),
+                  (tx + tw // 2 + 3, ty + 5), (0, 0, 0), -1)
+    cv2.putText(canvas, label, (tx - tw // 2, ty),
+                font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+
 def render_annotations(
     image_bgr: np.ndarray,
     lines: list[LineResult],
     arcs: list[ArcResult],
     highlight_type: str = "",
     highlight_id: str = "",
+    measurement_points: tuple | None = None,
 ) -> np.ndarray:
     """Draw line and arc annotations onto a copy of image_bgr.
 
@@ -853,6 +921,8 @@ def render_annotations(
         arcs: Arc results to draw.
         highlight_type: "line" or "arc" to highlight one feature.
         highlight_id: ID of the feature to highlight.
+        measurement_points: Optional (distance_mm, pt_a_px, pt_b_px) for
+            measurement overlay.
 
     Returns:
         Annotated BGR image.
@@ -922,6 +992,11 @@ def render_annotations(
                                 color, 3, tipLength=0.4)
                 cv2.line(canvas, tuple(p1), tuple(p2), color, 3, cv2.LINE_AA)
                 break
+
+    # Measurement overlay
+    if measurement_points is not None:
+        dist_mm, pt_a, pt_b = measurement_points
+        render_measurement_overlay(canvas, pt_a, pt_b, dist_mm)
 
     return canvas
 

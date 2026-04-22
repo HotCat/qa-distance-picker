@@ -32,7 +32,7 @@ from processing import (
 from calibration import CalibrationWorker, CalibrationResult
 from detect_lines import (
     LinesArcsWorker, LinesArcsResult, FeaturePair,
-    render_annotations, compute_feature_distance,
+    render_annotations, compute_feature_distance, compute_feature_pair_points,
 )
 
 
@@ -369,6 +369,7 @@ class PairListWindow(QWidget):
     """Floating window with feature pair table and tolerance controls."""
 
     config_confirmed = Signal(dict)
+    pair_row_selected = Signal(int)  # -1 for no selection, >= 0 for row index
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -398,14 +399,17 @@ class PairListWindow(QWidget):
         ])
         header = self._table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.Interactive)
+        header.setSectionResizeMode(2, QHeaderView.Interactive)
         header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self._table.setColumnWidth(1, 180)
+        self._table.setColumnWidth(2, 180)
         self._table.setAlternatingRowColors(True)
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
         self._table.setSelectionMode(QTableWidget.SingleSelection)
+        self._table.currentCellChanged.connect(self._on_row_changed)
         layout.addWidget(self._table)
 
         # Buttons
@@ -422,6 +426,12 @@ class PairListWindow(QWidget):
     def add_pair(self, pair: FeaturePair):
         self._pairs.append(pair)
         self._refresh_table()
+
+    def _on_row_changed(self, row: int, _col: int, _prev_row: int, _prev_col: int):
+        if 0 <= row < len(self._pairs):
+            self.pair_row_selected.emit(row)
+        else:
+            self.pair_row_selected.emit(-1)
 
     def _refresh_table(self):
         self._table.setRowCount(len(self._pairs))
@@ -541,6 +551,11 @@ class PairListWindow(QWidget):
                 'upper_mm': round(p.upper_mm, 3),
             })
         return [{'name': name, 'pairs': pairs_data}]
+
+    def get_pair(self, index: int) -> FeaturePair | None:
+        if 0 <= index < len(self._pairs):
+            return self._pairs[index]
+        return None
 
 class ProcessingState:
     """Holds all mutable state for the current processing image."""
@@ -672,9 +687,11 @@ class MainWindow(QMainWindow):
         self._results_window.filters_changed.connect(
             self._on_filters_changed)
 
-        # Pair list window → config save
+        # Pair list window → config save + measurement overlay
         self._pair_list_window.config_confirmed.connect(
             self._on_pair_config_confirmed)
+        self._pair_list_window.pair_row_selected.connect(
+            self._on_pair_row_selected)
 
     # ── Slots: camera frames ────────────────────────────────────────
 
@@ -877,6 +894,27 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._status_label.setText(f"Save failed: {e}")
 
+    @Slot(int)
+    def _on_pair_row_selected(self, row: int):
+        """Pair table row selected — render measurement overlay."""
+        if row < 0:
+            self._render_arclines()
+            return
+        pair = self._pair_list_window.get_pair(row)
+        if pair is None or self._last_arclines_result is None:
+            self._render_arclines()
+            return
+
+        result = self._last_arclines_result
+        pts = compute_feature_pair_points(
+            pair.type_a, pair.id_a, pair.type_b, pair.id_b,
+            result.lines, result.arcs, self._processor.pixel_size)
+        if pts is None:
+            self._render_arclines()
+            return
+
+        self._render_arclines(measurement_points=pts)
+
     # ── Render pipeline ───────────────────────────────────────────────
 
     @Slot(str, str)
@@ -891,7 +929,8 @@ class MainWindow(QMainWindow):
             self._results_window._apply_filters()
             self._render_arclines()
 
-    def _render_arclines(self, highlight_type="", highlight_id=""):
+    def _render_arclines(self, highlight_type="", highlight_id="",
+                         measurement_points=None):
         """Render annotated image from detection data with current filters."""
         result = self._last_arclines_result
         if result is None or self._proc_state is None:
@@ -909,7 +948,8 @@ class MainWindow(QMainWindow):
 
         annotated = render_annotations(
             image, filtered_lines, filtered_arcs,
-            highlight_type=highlight_type, highlight_id=highlight_id)
+            highlight_type=highlight_type, highlight_id=highlight_id,
+            measurement_points=measurement_points)
         self._display_image(annotated)
 
     # ── Mode transitions ────────────────────────────────────────────
@@ -982,6 +1022,10 @@ class MainWindow(QMainWindow):
         if self._current_mode != "processing":
             return
         if self._proc_state is None or self._proc_state.seg is None:
+            return
+
+        # When arclines results are displayed, skip old object-picking
+        if self._last_arclines_result is not None:
             return
 
         ix, iy = self._label_to_image(event.position().toPoint())
