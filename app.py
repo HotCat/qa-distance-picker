@@ -995,6 +995,7 @@ class MainWindow(QMainWindow):
         self._template_arc_grid: dict | None = None
         self._last_arclines_result: LinesArcsResult | None = None
         self._last_batch_results: list | None = None
+        self._last_composited: np.ndarray | None = None
         self._show_grid_overlay: bool = False
         self._show_segments_overlay: bool = False
 
@@ -1188,6 +1189,8 @@ class MainWindow(QMainWindow):
         """Reset picker state, keep current image."""
         self._picker_state = PICK_OBJECT1
         self._last_arclines_result = None
+        self._last_batch_results = None
+        self._last_composited = None
         self._template_arc_grid = None
         self._template_line_grid = None
         if self._proc_state:
@@ -1463,7 +1466,7 @@ class MainWindow(QMainWindow):
                                 max(0, pair_color[2] - 80),
                             )
                     render_measurement_overlay(canvas, pt_a, pt_b, dist, pair_color)
-            self._display_image(canvas)
+            self._show_composited(canvas)
 
         n_pass = sum(1 for dist, pair, _, _, _, _ in results
                      if dist is not None
@@ -1539,7 +1542,7 @@ class MainWindow(QMainWindow):
             arrow_start = (mid + (perp * 40)).astype(int)
             cv2.arrowedLine(canvas, tuple(arrow_start), tuple(mid),
                             (0, 0, 255), 3, tipLength=0.4)
-            self._display_image(canvas)
+            self._show_composited(canvas)
 
     @Slot(str, str, str, str)
     def _on_pair_added(self, type_a: str, id_a: str, type_b: str, id_b: str):
@@ -1626,14 +1629,6 @@ class MainWindow(QMainWindow):
     def _render_arclines(self, highlight_type="", highlight_id="",
                          measurement_points=None):
         """Render annotated image from detection data with current filters."""
-        # When debug overlays are active, use the overlay rendering path
-        if self._show_grid_overlay or self._show_segments_overlay:
-            self._refresh_with_overlays(
-                highlight_type=highlight_type,
-                highlight_id=highlight_id,
-                measurement_points=measurement_points)
-            return
-
         result = self._last_arclines_result
         if result is None or self._proc_state is None:
             return
@@ -1652,52 +1647,21 @@ class MainWindow(QMainWindow):
             image, filtered_lines, filtered_arcs,
             highlight_type=highlight_type, highlight_id=highlight_id,
             measurement_points=measurement_points)
-        self._display_image(annotated)
-
-    def _refresh_with_overlays(self, highlight_type="", highlight_id="",
-                                measurement_points=None):
-        """Re-render current image with debug overlays + arclines annotations."""
-        if self._proc_state is None or self._proc_state.image_bgr is None:
-            return
-
-        base = self._proc_state.image_bgr.copy()
-        det_cfg = self._config.get('detection', {})
-        pixel_size_mm = self._processor.pixel_size
-
-        if self._show_grid_overlay:
-            base = draw_grid_overlay(
-                base, pixel_size_mm, det_cfg.get('grid_size_mm', 5.0))
-
-        if self._show_segments_overlay:
-            base = draw_edge_segments(
-                base, pixel_size_mm, det_cfg.get('edge_segment_mm', 10.0))
-
-        # Arclines annotations on top of overlays
-        result = self._last_arclines_result
-        if result is not None:
-            fv = self._results_window.filter_values()
-            filtered_lines = [lr for lr in result.lines
-                             if fv['line_min_mm'] <= lr.length_mm <= fv['line_max_mm']]
-            filtered_arcs = [ar for ar in result.arcs
-                            if fv['arc_min_mm'] <= ar.radius_mm <= fv['arc_max_mm']]
-            base = render_annotations(
-                base, filtered_lines, filtered_arcs,
-                highlight_type=highlight_type, highlight_id=highlight_id,
-                measurement_points=measurement_points)
-
-        self._display_image(base)
+        self._show_composited(annotated)
 
     @Slot(int)
     def _on_grid_check_changed(self, state: int):
+        """Toggle grid overlay on top of current composited image."""
         self._show_grid_overlay = bool(state)
-        if self._proc_state and self._proc_state.image_bgr is not None:
-            self._refresh_with_overlays()
+        if self._last_composited is not None:
+            self._show_composited(self._last_composited)
 
     @Slot(int)
     def _on_segments_check_changed(self, state: int):
+        """Toggle segments overlay on top of current composited image."""
         self._show_segments_overlay = bool(state)
-        if self._proc_state and self._proc_state.image_bgr is not None:
-            self._refresh_with_overlays()
+        if self._last_composited is not None:
+            self._show_composited(self._last_composited)
 
     # ── Mode transitions ────────────────────────────────────────────
 
@@ -1714,7 +1678,9 @@ class MainWindow(QMainWindow):
         self._segments_check.setEnabled(False)
         self._image_label.setCursor(Qt.ArrowCursor)
         self._proc_state = None
+        self._last_composited = None
         self._last_arclines_result = None
+        self._last_batch_results = None
         self._template_arc_grid = None
         self._template_line_grid = None
         self._camera.set_live_mode()
@@ -1837,13 +1803,33 @@ class MainWindow(QMainWindow):
         self._image_label.setPixmap(scaled)
         self._display_pixmap = scaled  # prevent GC
 
+    def _show_composited(self, bgr_frame: np.ndarray):
+        """Store composited image (without debug overlays) and display it.
+
+        All rendering paths that produce a composited result (watershed,
+        arclines, batch inspect, measurement overlay) should call this instead
+        of _display_image directly.  Debug overlays (grid/segments) are applied
+        on top when enabled, without modifying the stored composited image.
+        """
+        self._last_composited = bgr_frame.copy()
+
+        if self._show_grid_overlay or self._show_segments_overlay:
+            canvas = bgr_frame.copy()
+            det_cfg = self._config.get('detection', {})
+            pixel_size_mm = self._processor.pixel_size
+            if self._show_grid_overlay:
+                canvas = draw_grid_overlay(
+                    canvas, pixel_size_mm, det_cfg.get('grid_size_mm', 5.0))
+            if self._show_segments_overlay:
+                canvas = draw_edge_segments(
+                    canvas, pixel_size_mm, det_cfg.get('edge_segment_mm', 10.0))
+            self._display_image(canvas)
+        else:
+            self._display_image(bgr_frame)
+
     def _refresh_overlay(self):
         """Re-render overlays and display."""
         if self._proc_state is None or self._proc_state.image_bgr is None:
-            return
-
-        if self._show_grid_overlay or self._show_segments_overlay:
-            self._refresh_with_overlays()
             return
 
         composited = OverlayRenderer.render(
@@ -1856,7 +1842,7 @@ class MainWindow(QMainWindow):
             self._proc_state.result,
             pixel_size=self._processor.pixel_size,
         )
-        self._display_image(composited)
+        self._show_composited(composited)
 
     def _label_to_image(self, pos: QPoint) -> tuple[int | None, int | None]:
         """Map QLabel click coordinates to original image coordinates."""
