@@ -39,6 +39,10 @@ from debug_overlay import (
     draw_grid_overlay, draw_edge_segments,
     compute_grid_cell, compute_edge_segments,
 )
+from alignment import (
+    ransac_rigid_registration, render_alignment_overlay,
+    AlignmentResult, RigidTransform,
+)
 
 
 def _app_dir() -> str:
@@ -648,6 +652,10 @@ class PairListWindow(QWidget):
             img_w, img_h, pixel_size_mm,
             det_cfg.get('edge_segment_mm', 10.0),
             det_cfg.get('grid_size_mm', 5.0),
+            line_min_mm=det_cfg.get('line_min_mm', 0.0),
+            line_max_mm=det_cfg.get('line_max_mm', float('inf')),
+            arc_min_mm=det_cfg.get('arc_min_mm', 0.0),
+            arc_max_mm=det_cfg.get('arc_max_mm', float('inf')),
         )
         # matches: list of (distance_mm | None, FeaturePair, pt_a, pt_b, det_a, det_b)
         for i, (dist, pair, pt_a, pt_b, det_a, det_b) in enumerate(matches):
@@ -729,7 +737,11 @@ class BatchInspectWorker(QThread):
 
     def __init__(self, image_bgr: np.ndarray, template_pairs: list[FeaturePair],
                  pixel_size_mm: float, gauss_sigma: float, morph_radius: int,
-                 grid_size_mm: float, segment_mm: float):
+                 grid_size_mm: float, segment_mm: float,
+                 line_min_mm: float = 0.0,
+                 line_max_mm: float = float('inf'),
+                 arc_min_mm: float = 0.0,
+                 arc_max_mm: float = float('inf')):
         super().__init__()
         self._image = image_bgr.copy()
         self._template_pairs = template_pairs
@@ -738,6 +750,10 @@ class BatchInspectWorker(QThread):
         self._morph_radius = morph_radius
         self._grid_size_mm = grid_size_mm
         self._segment_mm = segment_mm
+        self._line_min_mm = line_min_mm
+        self._line_max_mm = line_max_mm
+        self._arc_min_mm = arc_min_mm
+        self._arc_max_mm = arc_max_mm
 
     def run(self):
         try:
@@ -758,6 +774,10 @@ class BatchInspectWorker(QThread):
                 self._pixel_size_mm,
                 self._segment_mm,
                 self._grid_size_mm,
+                line_min_mm=self._line_min_mm,
+                line_max_mm=self._line_max_mm,
+                arc_min_mm=self._arc_min_mm,
+                arc_max_mm=self._arc_max_mm,
             )
             self.done.emit(matches)
         except Exception as e:
@@ -970,6 +990,135 @@ class ProcessingState:
 
 
 # ════════════════════════════════════════════════════════════════════════
+#  Alignment Playground
+# ════════════════════════════════════════════════════════════════════════
+
+class AlignmentWorker(QThread):
+    """Run RANSAC alignment in background thread."""
+
+    done = Signal(object)  # AlignmentResult
+    error = Signal(str)
+
+    def __init__(self, tmpl_lines, tmpl_arcs, det_lines, det_arcs,
+                 pixel_size_mm, n_iterations, inlier_threshold):
+        super().__init__()
+        self._tmpl_lines = tmpl_lines
+        self._tmpl_arcs = tmpl_arcs
+        self._det_lines = det_lines
+        self._det_arcs = det_arcs
+        self._pixel_size_mm = pixel_size_mm
+        self._n_iterations = n_iterations
+        self._inlier_threshold = inlier_threshold
+
+    def run(self):
+        try:
+            result = ransac_rigid_registration(
+                self._tmpl_lines, self._tmpl_arcs,
+                self._det_lines, self._det_arcs,
+                self._pixel_size_mm,
+                n_iterations=self._n_iterations,
+                inlier_threshold_mm=self._inlier_threshold,
+            )
+            if result is None:
+                self.error.emit("Alignment failed: not enough inlier matches")
+            else:
+                self.done.emit(result)
+        except Exception as e:
+            self.error.emit(f"Alignment failed: {e}")
+
+
+class AlignmentWindow(QWidget):
+    """Floating window for alignment experiment playground."""
+
+    align_requested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Alignment Playground")
+        self.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint)
+        self.setMinimumSize(400, 300)
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        # Status label
+        self._status = QLabel("Need both template and detected features.")
+        self._status.setWordWrap(True)
+        layout.addWidget(self._status)
+
+        # RANSAC parameters
+        param_group = QGroupBox("RANSAC Parameters")
+        param_layout = QFormLayout(param_group)
+
+        self._iter_spin = QSpinBox()
+        self._iter_spin.setRange(10, 1000)
+        self._iter_spin.setValue(200)
+        self._iter_spin.setToolTip("Number of RANSAC iterations")
+        param_layout.addRow("Iterations:", self._iter_spin)
+
+        self._threshold_spin = QDoubleSpinBox()
+        self._threshold_spin.setRange(0.5, 30.0)
+        self._threshold_spin.setValue(5.0)
+        self._threshold_spin.setSingleStep(0.5)
+        self._threshold_spin.setSuffix(" mm")
+        self._threshold_spin.setToolTip("Max distance for inlier classification")
+        param_layout.addRow("Inlier threshold:", self._threshold_spin)
+
+        layout.addWidget(param_group)
+
+        # Results
+        results_group = QGroupBox("Results")
+        results_layout = QFormLayout(results_group)
+
+        self._rotation_label = QLabel("—")
+        results_layout.addRow("Rotation:", self._rotation_label)
+
+        self._translation_label = QLabel("—")
+        results_layout.addRow("Translation:", self._translation_label)
+
+        self._inliers_label = QLabel("—")
+        results_layout.addRow("Inliers:", self._inliers_label)
+
+        self._rms_label = QLabel("—")
+        results_layout.addRow("Residual RMS:", self._rms_label)
+
+        layout.addWidget(results_group)
+
+        # Align button
+        self._align_btn = QPushButton("Align")
+        self._align_btn.clicked.connect(self._on_align_clicked)
+        layout.addWidget(self._align_btn)
+
+    def _on_align_clicked(self):
+        self._align_btn.setEnabled(False)
+        self._align_btn.setText("Computing...")
+        self.align_requested.emit()
+
+    def get_params(self) -> dict:
+        return {
+            'n_iterations': self._iter_spin.value(),
+            'inlier_threshold_mm': self._threshold_spin.value(),
+        }
+
+    def show_results(self, result: AlignmentResult):
+        t = result.transform
+        self._rotation_label.setText(f"{t.rotation_deg:.2f} deg")
+        self._translation_label.setText(
+            f"({t.translation_mm[0]:.2f}, {t.translation_mm[1]:.2f}) mm")
+        self._inliers_label.setText(f"{result.inlier_count}")
+        self._rms_label.setText(f"{result.residual_rms_mm:.3f} mm")
+        self.reset_button()
+
+    def set_status(self, text: str):
+        self._status.setText(text)
+
+    def reset_button(self):
+        self._align_btn.setEnabled(True)
+        self._align_btn.setText("Align")
+
+
+# ════════════════════════════════════════════════════════════════════════
 #  Main Window
 # ════════════════════════════════════════════════════════════════════════
 
@@ -993,6 +1142,8 @@ class MainWindow(QMainWindow):
         self._active_worker: QThread | None = None
         self._template_line_grid: dict | None = None
         self._template_arc_grid: dict | None = None
+        self._template_lines: list | None = None
+        self._template_arcs: list | None = None
         self._last_arclines_result: LinesArcsResult | None = None
         self._last_batch_results: list | None = None
         self._last_composited: np.ndarray | None = None
@@ -1070,6 +1221,12 @@ class MainWindow(QMainWindow):
         self._batch_btn.setEnabled(False)
         toolbar.addWidget(self._batch_btn)
 
+        self._alignment_btn = QPushButton("Alignment")
+        self._alignment_btn.setEnabled(False)
+        self._alignment_btn.setToolTip(
+            "RANSAC rigid registration between template and product features")
+        toolbar.addWidget(self._alignment_btn)
+
         # Status bar
         self._status_label = QLabel("No camera connected")
         self.statusBar().addWidget(self._status_label, 1)
@@ -1085,6 +1242,9 @@ class MainWindow(QMainWindow):
 
         # Batch inspect window (floating)
         self._batch_inspect_window = BatchInspectWindow(self)
+
+        # Alignment playground window (floating)
+        self._alignment_window = AlignmentWindow(self)
 
     # ── Signal wiring ───────────────────────────────────────────────
 
@@ -1103,10 +1263,13 @@ class MainWindow(QMainWindow):
         self._calib_btn.clicked.connect(self._on_calib_clicked)
         self._arclines_btn.clicked.connect(self._on_arclines_clicked)
         self._batch_btn.clicked.connect(self._on_batch_inspect_clicked)
+        self._alignment_btn.clicked.connect(self._on_alignment_clicked)
         self._batch_inspect_window.inspect_requested.connect(
             self._on_inspect_requested)
         self._batch_inspect_window.pair_row_selected.connect(
             self._on_batch_row_selected)
+        self._alignment_window.align_requested.connect(
+            self._on_alignment_run)
 
         # Settings → camera
         self._settings_window.settings_changed.connect(
@@ -1193,6 +1356,8 @@ class MainWindow(QMainWindow):
         self._last_composited = None
         self._template_arc_grid = None
         self._template_line_grid = None
+        self._template_lines = None
+        self._template_arcs = None
         if self._proc_state:
             self._proc_state.obj1_id = None
             self._proc_state.obj2_id = None
@@ -1310,6 +1475,11 @@ class MainWindow(QMainWindow):
         if self._template_arc_grid is None:
             self._template_arc_grid = result.arc_grid
 
+        # Store template features for alignment playground
+        if self._template_lines is None:
+            self._template_lines = result.lines
+            self._template_arcs = result.arcs
+
         self._results_window.update_results(result)
         self._results_window.show()
         self._pair_list_window.show()
@@ -1333,6 +1503,7 @@ class MainWindow(QMainWindow):
         self._active_worker = None
         self._status_label.setText(f"Error: {msg}")
         self._results_window.reset_redetect_button()
+        self._alignment_window.reset_button()
 
     # ── Batch inspect ────────────────────────────────────────────────
 
@@ -1397,6 +1568,10 @@ class MainWindow(QMainWindow):
             morph_radius=proc_cfg.get('morph_radius', 3),
             grid_size_mm=det_cfg.get('grid_size_mm', 5.0),
             segment_mm=det_cfg.get('edge_segment_mm', 10.0),
+            line_min_mm=det_cfg.get('line_min_mm', 0.0),
+            line_max_mm=det_cfg.get('line_max_mm', float('inf')),
+            arc_min_mm=det_cfg.get('arc_min_mm', 0.0),
+            arc_max_mm=det_cfg.get('arc_max_mm', float('inf')),
         )
         worker.done.connect(self._on_batch_inspect_done)
         worker.error.connect(self._on_batch_inspect_error)
@@ -1544,6 +1719,81 @@ class MainWindow(QMainWindow):
                             (0, 0, 255), 3, tipLength=0.4)
             self._show_composited(canvas)
 
+    # ── Alignment playground ────────────────────────────────────────────
+
+    @Slot()
+    def _on_alignment_clicked(self):
+        """Show alignment playground window."""
+        # Check if we have both template and current features
+        has_template = self._template_lines is not None or self._template_arcs is not None
+        has_current = self._last_arclines_result is not None
+        if has_template and has_current:
+            self._alignment_window.set_status(
+                f"Template: {len(self._template_lines or [])} lines, "
+                f"{len(self._template_arcs or [])} arcs. "
+                f"Current: {len(self._last_arclines_result.lines)} lines, "
+                f"{len(self._last_arclines_result.arcs)} arcs.")
+        elif has_template and not has_current:
+            self._alignment_window.set_status(
+                "Template features stored. Run Arclines on current frame first.")
+        elif not has_template and has_current:
+            self._alignment_window.set_status(
+                "Current features detected. Need template — "
+                "run Arclines once to store template, then Redetect for current.")
+        else:
+            self._alignment_window.set_status(
+                "Need both template and detected features. "
+                "Run Arclines, then Redetect to get a second frame.")
+        self._alignment_window.show()
+
+    @Slot()
+    def _on_alignment_run(self):
+        """Run RANSAC alignment between template and current features."""
+        if self._template_lines is None and self._template_arcs is None:
+            self._alignment_window.set_status("No template features stored.")
+            self._alignment_window.reset_button()
+            return
+        if self._last_arclines_result is None:
+            self._alignment_window.set_status("No current detection results.")
+            self._alignment_window.reset_button()
+            return
+
+        params = self._alignment_window.get_params()
+        worker = AlignmentWorker(
+            self._template_lines or [],
+            self._template_arcs or [],
+            self._last_arclines_result.lines,
+            self._last_arclines_result.arcs,
+            self._processor.pixel_size,
+            params['n_iterations'],
+            params['inlier_threshold_mm'],
+        )
+        worker.done.connect(self._on_alignment_done)
+        worker.error.connect(self._on_alignment_error)
+        self._active_worker = worker
+        worker.start()
+
+    def _on_alignment_done(self, result: AlignmentResult):
+        """Alignment completed — show results and render overlay."""
+        self._active_worker = None
+        self._alignment_window.show_results(result)
+
+        if self._proc_state and self._proc_state.image_bgr is not None:
+            overlay = render_alignment_overlay(
+                self._proc_state.image_bgr, result,
+                self._template_lines or [], self._template_arcs or [],
+                self._last_arclines_result.lines,
+                self._last_arclines_result.arcs,
+                self._processor.pixel_size,
+            )
+            self._show_composited(overlay)
+
+    def _on_alignment_error(self, msg: str):
+        """Alignment failed."""
+        self._active_worker = None
+        self._alignment_window.set_status(f"Error: {msg}")
+        self._alignment_window.reset_button()
+
     @Slot(str, str, str, str)
     def _on_pair_added(self, type_a: str, id_a: str, type_b: str, id_b: str):
         """Two features Ctrl-selected — compute distance and add to pair list."""
@@ -1674,6 +1924,7 @@ class MainWindow(QMainWindow):
         self._calib_btn.setEnabled(False)
         self._arclines_btn.setEnabled(False)
         self._batch_btn.setEnabled(False)
+        self._alignment_btn.setEnabled(False)
         self._grid_check.setEnabled(False)
         self._segments_check.setEnabled(False)
         self._image_label.setCursor(Qt.ArrowCursor)
@@ -1683,6 +1934,8 @@ class MainWindow(QMainWindow):
         self._last_batch_results = None
         self._template_arc_grid = None
         self._template_line_grid = None
+        self._template_lines = None
+        self._template_arcs = None
         self._camera.set_live_mode()
         self._status_label.setText("Live View")
 
@@ -1695,6 +1948,7 @@ class MainWindow(QMainWindow):
         self._calib_btn.setEnabled(True)
         self._arclines_btn.setEnabled(True)
         self._batch_btn.setEnabled(True)
+        self._alignment_btn.setEnabled(True)
         self._grid_check.setEnabled(True)
         self._segments_check.setEnabled(True)
         self._image_label.setCursor(Qt.CrossCursor)

@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Fuzzy Feature Matching for Template-Based Metrology</title>
+<style>
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.6;
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 40px 20px;
+    background-color: #fafafa;
+    color: #333;
+}
+h1, h2, h3 {
+    color: #2c3e50;
+    border-bottom: 1px solid #eee;
+    padding-bottom: 10px;
+}
+h1 { font-size: 2em; }
+h2 { font-size: 1.5em; margin-top: 30px; }
+h3 { font-size: 1.2em; margin-top: 20px; }
+table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 20px 0;
+}
+th, td {
+    border: 1px solid #ddd;
+    padding: 12px 15px;
+    text-align: left;
+}
+th {
+    background-color: #f5f5f5;
+    font-weight: 600;
+}
+code {
+    background-color: #f0f0f0;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+}
+pre {
+    background-color: #f0f0f0;
+    padding: 15px;
+    border-radius: 5px;
+    overflow-x: auto;
+}
+blockquote {
+    border-left: 4px solid #ddd;
+    margin: 0;
+    padding-left: 20px;
+    color: #666;
+}
+</style>
+</head>
+<body>
+<h1>Fuzzy Feature Matching for Template-Based Metrology</h1>
+<h2>Purpose</h2>
+<p>In production quality assurance, manufactured workpieces are measured repeatedly
+against a saved template. Each measurement captures a new camera frame, detects
+geometric features (lines and arcs), and compares distances between matched
+features to the template's nominal values.</p>
+<p>The challenge: the workpiece shifts and rotates slightly between placements.
+Feature IDs change across runs because they encode spatial position. The <strong>fuzzy
+matching algorithm</strong> bridges this gap by matching template feature IDs to newly
+detected features using spatial proximity and geometric similarity, without
+requiring exact ID equality.</p>
+<hr />
+<h2>Feature ID Systems</h2>
+<p>Two complementary ID systems provide the spatial anchors that make fuzzy matching
+possible.</p>
+<h3>Arc IDs: Grid-Cell Assignment</h3>
+<p>Arcs (curves detected via curvature analysis and RANSAC circle fitting) are
+assigned IDs based on a uniform grid overlaid on the image in millimeter space.</p>
+<p><strong>ID format:</strong> <code>C{row}_{col}_{radius_bucket}</code></p>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>row</code></td>
+<td>Grid row index: <code>y_mm // grid_size_mm</code></td>
+</tr>
+<tr>
+<td><code>col</code></td>
+<td>Grid column index: <code>x_mm // grid_size_mm</code></td>
+</tr>
+<tr>
+<td><code>radius_bucket</code></td>
+<td>Integer part of radius in mm (<code>int(radius_mm)</code>)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Example:</strong> <code>C4_13_4</code> means the arc centroid is in grid row 4, column 13, with
+radius approximately 4 mm.</p>
+<p><strong>Configurable parameter:</strong> <code>grid_size_mm</code> (default 5.0 mm) controls the grid
+cell size. A larger grid tolerates more positional offset but risks merging
+nearby arcs into the same cell.</p>
+<p><strong>How grid cells tolerate offset:</strong></p>
+<p>If a workpiece shifts 3 mm horizontally, an arc at column 13 might move to
+column 12 or 14. The fuzzy matcher accepts a ±1 cell difference (configurable
+via the scoring weight), so the arc still matches its template entry. With a
+5 mm grid, the system tolerates roughly ±5 mm of positional shift before a
+feature migrates two cells away.</p>
+<h3>Line IDs: Edge-Segment Assignment</h3>
+<p>Lines (detected via LSD and collinear merging) are assigned IDs based on where
+they intersect the image frame edges.</p>
+<p><strong>ID format:</strong> <code>L_{edge1}{seg1}_{edge2}{seg2}_{angle}_{length_mm}</code></p>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>edge1</code></td>
+<td>First intersected edge name: <code>Up</code>, <code>Lo</code>, <code>Le</code>, or <code>Ri</code></td>
+</tr>
+<tr>
+<td><code>seg1</code></td>
+<td>1-indexed segment number along that edge</td>
+</tr>
+<tr>
+<td><code>edge2</code></td>
+<td>Second intersected edge name</td>
+</tr>
+<tr>
+<td><code>seg2</code></td>
+<td>1-indexed segment number along that edge</td>
+</tr>
+<tr>
+<td><code>angle</code></td>
+<td>Line angle in degrees (0–180)</td>
+</tr>
+<tr>
+<td><code>length</code></td>
+<td>Line length in mm (rounded to 2 decimal places)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Example:</strong> <code>L_Up8_Lo7_90.4_76.60</code> is a vertical line crossing through segment
+8 of the top edge and segment 7 of the bottom edge, at 90.4° and 76.60 mm long.</p>
+<p><strong>Configurable parameter:</strong> <code>edge_segment_mm</code> (default 10.0 mm) controls how
+finely each edge is divided into numbered segments.</p>
+<p><strong>How segments tolerate offset:</strong></p>
+<p>If a line crosses the top edge at segment 8 on the template and segment 7 on
+the product (due to a small horizontal shift), the fuzzy matcher's segment
+distance score adds a penalty but does not reject the match. The segment
+scoring weight (10 per segment difference) allows ±1–2 segment differences
+while still preferring closer matches.</p>
+<hr />
+<h2>Scoring Functions</h2>
+<p>The fuzzy matcher builds a <strong>cost matrix</strong> where each cell contains a score
+representing how well a detected feature matches a template feature. Lower
+scores mean better matches.</p>
+<h3>Line Matching Score</h3>
+<p><code>_score_line_match(template_parsed, detected_line)</code> computes:</p>
+<table>
+<thead>
+<tr>
+<th>Criterion</th>
+<th>Weight</th>
+<th>Tolerance</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Edge pair match</td>
+<td>—</td>
+<td>Must match exactly</td>
+<td>Reject if different edge names</td>
+</tr>
+<tr>
+<td>Segment distance</td>
+<td>10</td>
+<td>Per segment difference</td>
+<td>Allows ±1–2 segment drift</td>
+</tr>
+<tr>
+<td>Angle difference</td>
+<td>2</td>
+<td>Per degree</td>
+<td>Allows ~5° orientation change</td>
+</tr>
+<tr>
+<td>Length ratio</td>
+<td>50</td>
+<td>Per 100% deviation</td>
+<td>Allows ~15% length variation</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Formula:</strong> <code>score = seg_dist * 10 + angle_diff * 2 + length_ratio * 50</code></p>
+<p>A short noisy line crossing different edges returns infinity (no match). A
+genuine line that shifted slightly gets a small penalty proportional to the
+segment drift.</p>
+<h3>Arc Matching Score</h3>
+<p><code>_score_arc_match(template_parsed, detected_arc)</code> computes:</p>
+<table>
+<thead>
+<tr>
+<th>Criterion</th>
+<th>Weight</th>
+<th>Tolerance</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Grid cell distance</td>
+<td>10</td>
+<td>Manhattan distance</td>
+<td>Allows ±1–2 cell drift</td>
+</tr>
+<tr>
+<td>Radius bucket diff</td>
+<td>5</td>
+<td>Per integer mm</td>
+<td>Allows ~1–2 mm radius variation</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Formula:</strong> <code>score = grid_dist * 10 + radius_diff * 5</code></p>
+<hr />
+<h2>Hungarian Assignment</h2>
+<p>After scoring all template–detected pairs, the algorithm uses the <strong>Hungarian
+method</strong> (<code>scipy.optimize.linear_sum_assignment</code>) to find the optimal 1-to-1
+assignment that minimizes total cost.</p>
+<p><strong>Why Hungarian?</strong> Without it, two template features near the same detected
+feature could both claim it. The Hungarian method ensures each detected feature
+is assigned to at most one template feature, and vice versa, producing a
+globally optimal matching.</p>
+<p><strong>Process:</strong>
+1. Build cost matrix: template features (rows) × detected features (columns)
+2. Set impossible matches to 1e9 (infinity)
+3. <code>linear_sum_assignment(cost)</code> returns the optimal row-column assignment
+4. Discard assignments with cost ≥ 1e8 (unreasonable matches)</p>
+<hr />
+<h2>Feature Pair Workflow</h2>
+<h3>1. Template Creation</h3>
+<p>The user runs detection on a reference workpiece. In the Detection Results
+window, they Ctrl-click two features (one line or arc each) to create a
+<strong>Feature Pair</strong> — a named measurement relationship:</p>
+<pre><code>FeaturePair:
+  type_a = &quot;arc&quot;,   id_a = &quot;C4_14_4&quot;
+  type_b = &quot;arc&quot;,   id_b = &quot;C5_5_4&quot;
+  distance_mm = 45.95    # measured distance between features
+  lower_mm = 0.0         # tolerance lower bound
+  upper_mm = 0.0         # tolerance upper bound
+</code></pre>
+<p>Multiple pairs can be saved as a named configuration (product template).</p>
+<h3>2. Production Matching</h3>
+<p>When a new product is placed on the fixture:</p>
+<ol>
+<li><strong>Detect</strong> lines and arcs on the new frame</li>
+<li><strong>Filter</strong> by line length and arc radius criteria (from Detection Results page)</li>
+<li><strong>Match</strong> template feature IDs to detected features using fuzzy scoring + Hungarian assignment</li>
+<li><strong>Measure</strong> distances between matched pairs</li>
+<li><strong>Evaluate</strong> pass/fail against tolerance bounds</li>
+</ol>
+<h3>3. Filter Criteria Integration</h3>
+<p>The line length (<code>line_min_mm</code>–<code>line_max_mm</code>) and arc radius
+(<code>arc_min_mm</code>–<code>arc_max_mm</code>) filter criteria from the Detection Results page are
+applied <strong>before</strong> fuzzy matching. Short noisy lines and tiny arc fragments are
+excluded from the cost matrix, preventing false matches.</p>
+<hr />
+<h2>Data Flow Diagram</h2>
+<pre><code>Camera Frame
+     │
+     ▼
+Watershed Segmentation → Object Boundaries
+     │
+     ├── LSD Line Detection → Merge → LineResult list
+     │                              (start_px, end_px, length_mm, angle_deg, centroid_mm)
+     │
+     └── Curvature Analysis → RANSAC Circle Fit → ArcResult list
+                                      (center_px, radius_px, radius_mm, centroid_mm)
+     │
+     ▼
+ID Assignment (Grid + Edge-Segments)
+     │
+     ├── Lines: _assign_line_ids_by_edges → &quot;L_Up8_Lo7_90.4_76.60&quot;
+     └── Arcs:  _assign_arc_ids_by_grid   → &quot;C4_13_4&quot;
+     │
+     ▼
+Filter by line_min_mm/line_max_mm and arc_min_mm/arc_max_mm
+     │
+     ▼
+Fuzzy Matching (Hungarian Assignment)
+     │
+     ├── _score_line_match: edge pair + segment + angle + length
+     └── _score_arc_match:  grid cell + radius bucket
+     │
+     ▼
+Distance Measurement
+     │
+     ├── distance_line_to_line: perpendicular distance
+     ├── distance_arc_to_arc:   center-to-center distance
+     └── distance_line_to_arc:  perpendicular from arc center to line
+     │
+     ▼
+Pass/Fail Evaluation (lower_mm ≤ distance ≤ upper_mm)
+</code></pre>
+<hr />
+<h2>Key Design Decisions</h2>
+<ul>
+<li>
+<p><strong>Grid and segments are tolerance mechanisms</strong>: They quantize continuous
+  positions into discrete bins, providing natural tolerance windows. A 5 mm grid
+  means ±2.5 mm of positional shift keeps a feature in the same cell.</p>
+</li>
+<li>
+<p><strong>Hungarian prevents double-booking</strong>: Without 1-to-1 constraints, the
+  closest detected feature would be claimed by multiple template features,
+  producing incorrect distance measurements.</p>
+</li>
+<li>
+<p><strong>Filter criteria gate the matcher</strong>: Short lines from noise or edge
+  fragments never enter the cost matrix. This is more robust than relying on
+  scoring penalties alone, since a short line in the right grid cell could
+  otherwise outscore a genuine long line.</p>
+</li>
+<li>
+<p><strong>ID inheritance across runs</strong>: On subsequent detections, the system first
+  tries to match features to the template grid/segment map. If a feature falls
+  in the same cell with similar geometry, it inherits the template ID. This
+  makes IDs stable across runs, enabling the template matching workflow.</p>
+</li>
+</ul>
+</body>
+</html>

@@ -884,12 +884,17 @@ def fuzzy_match_template_pairs(
     pixel_size_mm: float,
     segment_mm: float,
     grid_size_mm: float,
+    line_min_mm: float = 0.0,
+    line_max_mm: float = float('inf'),
+    arc_min_mm: float = 0.0,
+    arc_max_mm: float = float('inf'),
 ) -> list[tuple[float | None, FeaturePair]]:
     """Match template pair IDs to detected features using fuzzy matching.
 
     Uses Hungarian assignment for 1-to-1 matching between template features
     and detected features, ensuring each detected feature matches at most one
-    template feature.
+    template feature. Detected features are pre-filtered by line length and
+    arc radius criteria before matching.
 
     Args:
         template_pairs: List of FeaturePair from a saved template.
@@ -929,17 +934,23 @@ def fuzzy_match_template_pairs(
     tmpl_lines = [(k, v) for k, v in template_features.items() if k[0] == 'line']
     tmpl_arcs = [(k, v) for k, v in template_features.items() if k[0] == 'arc']
 
+    # Pre-filter detected features by length/radius criteria
+    filtered_lines = [l for l in detected_lines
+                     if line_min_mm <= l.length_mm <= line_max_mm]
+    filtered_arcs = [a for a in detected_arcs
+                    if arc_min_mm <= a.radius_mm <= arc_max_mm]
+
     # Build cost matrix for lines
     line_assignment = {}
-    if tmpl_lines and detected_lines:
+    if tmpl_lines and filtered_lines:
         n_tmpl = len(tmpl_lines)
-        n_det = len(detected_lines)
+        n_det = len(filtered_lines)
         cost = np.full((n_tmpl, n_det), 1e9)
 
         for i, (key, parsed) in enumerate(tmpl_lines):
             if parsed is None:
                 continue
-            for j, det in enumerate(detected_lines):
+            for j, det in enumerate(filtered_lines):
                 score = _score_line_match(parsed, det, img_w, img_h,
                                           pixel_size_mm, segment_mm)
                 cost[i, j] = score
@@ -947,26 +958,26 @@ def fuzzy_match_template_pairs(
         row_ind, col_ind = linear_sum_assignment(cost)
         for r, c in zip(row_ind, col_ind):
             if cost[r, c] < 1e8:  # reasonable threshold
-                line_assignment[tmpl_lines[r][0]] = detected_lines[c]
+                line_assignment[tmpl_lines[r][0]] = filtered_lines[c]
 
     # Build cost matrix for arcs
     arc_assignment = {}
-    if tmpl_arcs and detected_arcs:
+    if tmpl_arcs and filtered_arcs:
         n_tmpl = len(tmpl_arcs)
-        n_det = len(detected_arcs)
+        n_det = len(filtered_arcs)
         cost = np.full((n_tmpl, n_det), 1e9)
 
         for i, (key, parsed) in enumerate(tmpl_arcs):
             if parsed is None:
                 continue
-            for j, det in enumerate(detected_arcs):
+            for j, det in enumerate(filtered_arcs):
                 score = _score_arc_match(parsed, det, grid_size_mm)
                 cost[i, j] = score
 
         row_ind, col_ind = linear_sum_assignment(cost)
         for r, c in zip(row_ind, col_ind):
             if cost[r, c] < 1e8:
-                arc_assignment[tmpl_arcs[r][0]] = detected_arcs[c]
+                arc_assignment[tmpl_arcs[r][0]] = filtered_arcs[c]
 
     # Compute distances for each template pair
     results = []
