@@ -9,6 +9,7 @@ Modes:
 
 import sys
 import os
+import json
 import yaml
 import cv2
 import numpy as np
@@ -41,7 +42,7 @@ from debug_overlay import (
 )
 from alignment import (
     ransac_rigid_registration, render_alignment_overlay,
-    AlignmentResult, RigidTransform,
+    AlignmentResult, RigidTransform, apply_transform,
 )
 
 
@@ -50,6 +51,41 @@ def _app_dir() -> str:
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def _serialize_features(lines, arcs):
+    """Serialize LineResult/ArcResult lists to JSON-compatible dict."""
+    from detect_lines import LineResult, ArcResult
+    return {
+        'lines': [{
+            'id': l.id, 'category': l.category,
+            'start_px': l.start_px.tolist(), 'end_px': l.end_px.tolist(),
+            'length_mm': float(l.length_mm), 'angle_deg': float(l.angle_deg),
+            'centroid_mm': l.centroid_mm.tolist(),
+        } for l in lines],
+        'arcs': [{
+            'id': a.id,
+            'center_px': a.center_px.tolist(), 'radius_px': float(a.radius_px),
+            'radius_mm': float(a.radius_mm), 'centroid_mm': a.centroid_mm.tolist(),
+        } for a in arcs],
+    }
+
+
+def _deserialize_features(data):
+    """Deserialize features dict back to LineResult/ArcResult lists."""
+    from detect_lines import LineResult, ArcResult
+    lines = [LineResult(
+        id=l['id'], category=l['category'],
+        start_px=np.array(l['start_px']), end_px=np.array(l['end_px']),
+        length_mm=l['length_mm'], angle_deg=l['angle_deg'],
+        centroid_mm=np.array(l['centroid_mm']),
+    ) for l in data.get('lines', [])]
+    arcs = [ArcResult(
+        id=a['id'],
+        center_px=np.array(a['center_px']), radius_px=a['radius_px'],
+        radius_mm=a['radius_mm'], centroid_mm=np.array(a['centroid_mm']),
+    ) for a in data.get('arcs', [])]
+    return lines, arcs
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -730,9 +766,10 @@ class PairListWindow(QWidget):
 # ════════════════════════════════════════════════════════════════════════
 
 class BatchInspectWorker(QThread):
-    """Run detection + fuzzy matching for batch inspection."""
+    """Run detection + fuzzy matching for batch inspection, with optional alignment."""
 
     done = Signal(list)  # list of (distance_mm | None, FeaturePair, pt_a, pt_b)
+    alignment_done = Signal(object)  # AlignmentResult
     error = Signal(str)
 
     def __init__(self, image_bgr: np.ndarray, template_pairs: list[FeaturePair],
@@ -741,7 +778,11 @@ class BatchInspectWorker(QThread):
                  line_min_mm: float = 0.0,
                  line_max_mm: float = float('inf'),
                  arc_min_mm: float = 0.0,
-                 arc_max_mm: float = float('inf')):
+                 arc_max_mm: float = float('inf'),
+                 alignment_enabled: bool = False,
+                 template_features_path: str = "",
+                 alignment_iterations: int = 200,
+                 alignment_threshold_mm: float = 5.0):
         super().__init__()
         self._image = image_bgr.copy()
         self._template_pairs = template_pairs
@@ -754,6 +795,10 @@ class BatchInspectWorker(QThread):
         self._line_max_mm = line_max_mm
         self._arc_min_mm = arc_min_mm
         self._arc_max_mm = arc_max_mm
+        self._alignment_enabled = alignment_enabled
+        self._template_features_path = template_features_path
+        self._alignment_iterations = alignment_iterations
+        self._alignment_threshold_mm = alignment_threshold_mm
 
     def run(self):
         try:
@@ -766,10 +811,43 @@ class BatchInspectWorker(QThread):
                 edge_segment_mm=self._segment_mm,
             )
             img_h, img_w = self._image.shape[:2]
-            # Run fuzzy matching
+
+            detected_lines = result.lines
+            detected_arcs = result.arcs
+
+            # Apply alignment if enabled
+            alignment_result = None
+            if self._alignment_enabled and self._template_features_path:
+                if os.path.exists(self._template_features_path):
+                    with open(self._template_features_path) as f:
+                        feat_data = json.load(f)
+                    tmpl_lines, tmpl_arcs = _deserialize_features(feat_data)
+
+                    # Run RANSAC alignment
+                    alignment_result = ransac_rigid_registration(
+                        tmpl_lines, tmpl_arcs,
+                        detected_lines, detected_arcs,
+                        self._pixel_size_mm,
+                        n_iterations=self._alignment_iterations,
+                        inlier_threshold_mm=self._alignment_threshold_mm,
+                    )
+
+                    if alignment_result:
+                        # Transform detected feature centroids
+                        t = alignment_result.transform
+                        for lr in detected_lines:
+                            lr.centroid_mm = apply_transform(
+                                lr.centroid_mm.reshape(1, 2), t).flatten()
+                        for ar in detected_arcs:
+                            ar.centroid_mm = apply_transform(
+                                ar.centroid_mm.reshape(1, 2), t).flatten()
+
+                        self.alignment_done.emit(alignment_result)
+
+            # Run fuzzy matching (with possibly transformed features)
             matches = fuzzy_match_template_pairs(
                 self._template_pairs,
-                result.lines, result.arcs,
+                detected_lines, detected_arcs,
                 img_w, img_h,
                 self._pixel_size_mm,
                 self._segment_mm,
@@ -1221,6 +1299,12 @@ class MainWindow(QMainWindow):
         self._batch_btn.setEnabled(False)
         toolbar.addWidget(self._batch_btn)
 
+        self._align_batch_check = QCheckBox("Align")
+        self._align_batch_check.setToolTip(
+            "Enable RANSAC alignment before batch metrology matching")
+        self._align_batch_check.setEnabled(False)
+        toolbar.addWidget(self._align_batch_check)
+
         self._alignment_btn = QPushButton("Alignment")
         self._alignment_btn.setEnabled(False)
         self._alignment_btn.setToolTip(
@@ -1556,7 +1640,24 @@ class MainWindow(QMainWindow):
             self._batch_inspect_window.reset_button()
             return
 
-        self._status_label.setText("Running batch inspection...")
+        # Find template features path for alignment
+        template_features_path = ""
+        for cfg in self._config.get('feature_pairs', []):
+            if cfg.get('name') == template_name:
+                template_features_path = cfg.get('template_features', '')
+                break
+
+        alignment_enabled = self._align_batch_check.isChecked()
+        if alignment_enabled and not template_features_path:
+            self._status_label.setText(
+                f"No template features saved for '{template_name}' — "
+                "re-confirm config to save features")
+            self._batch_inspect_window.reset_button()
+            return
+
+        self._status_label.setText(
+            "Running batch inspection..." +
+            (" (with alignment)" if alignment_enabled else ""))
 
         proc_cfg = self._config.get('processing', {})
         det_cfg = self._config.get('detection', {})
@@ -1572,8 +1673,13 @@ class MainWindow(QMainWindow):
             line_max_mm=det_cfg.get('line_max_mm', float('inf')),
             arc_min_mm=det_cfg.get('arc_min_mm', 0.0),
             arc_max_mm=det_cfg.get('arc_max_mm', float('inf')),
+            alignment_enabled=alignment_enabled,
+            template_features_path=template_features_path,
+            alignment_iterations=200,
+            alignment_threshold_mm=5.0,
         )
         worker.done.connect(self._on_batch_inspect_done)
+        worker.alignment_done.connect(self._on_batch_alignment_done)
         worker.error.connect(self._on_batch_inspect_error)
         self._active_worker = worker
         worker.start()
@@ -1656,6 +1762,15 @@ class MainWindow(QMainWindow):
         self._status_label.setText(
             f"Batch inspect done: {n_measured}/{n_total} measured, "
             f"{n_pass} pass, {n_fail} fail")
+
+    @Slot(object)
+    def _on_batch_alignment_done(self, result: AlignmentResult):
+        """Alignment completed during batch inspect — log to status."""
+        t = result.transform
+        self._status_label.setText(
+            f"Aligned: rot={t.rotation_deg:.2f}°, "
+            f"trans=({t.translation_mm[0]:.2f}, {t.translation_mm[1]:.2f})mm, "
+            f"{result.inlier_count} inliers, RMS={result.residual_rms_mm:.3f}mm")
 
     @Slot(str)
     def _on_batch_inspect_error(self, msg: str):
@@ -1818,8 +1933,35 @@ class MainWindow(QMainWindow):
             f"Pair added: {id_a} ↔ {id_b} = {dist:.3f} mm")
 
     def _on_pair_config_confirmed(self, configs: list):
-        """User confirmed pair configuration — save all configs to config.yaml."""
+        """User confirmed pair configuration — save all configs and template images."""
         self._config['feature_pairs'] = configs
+
+        # Save template image and features for the current config
+        if (self._proc_state and self._proc_state.image_bgr is not None
+                and self._pair_list_window._current_index >= 0):
+            cfg_name = self._pair_list_window._name_edit.text().strip() or "unnamed"
+            templates_dir = os.path.join(_app_dir(), 'templates')
+            os.makedirs(templates_dir, exist_ok=True)
+            safe_name = "".join(c if c.isalnum() or c in ('_', '-') else '_'
+                                for c in cfg_name)
+            tmpl_path = os.path.join(templates_dir, f"{safe_name}.png")
+            cv2.imwrite(tmpl_path, self._proc_state.image_bgr)
+
+            # Save template features for alignment
+            feat_path = os.path.join(templates_dir, f"{safe_name}_features.json")
+            tmpl_lines = self._template_lines or []
+            tmpl_arcs = self._template_arcs or []
+            if tmpl_lines or tmpl_arcs:
+                with open(feat_path, 'w') as f:
+                    json.dump(_serialize_features(tmpl_lines, tmpl_arcs), f)
+
+            # Store paths in the config entry
+            idx = self._pair_list_window._current_index
+            if 0 <= idx < len(self._config['feature_pairs']):
+                self._config['feature_pairs'][idx]['template_image'] = tmpl_path
+                if tmpl_lines or tmpl_arcs:
+                    self._config['feature_pairs'][idx]['template_features'] = feat_path
+
         config_path = os.path.join(_app_dir(), 'config.yaml')
         try:
             with open(config_path, 'w') as f:
@@ -1925,6 +2067,7 @@ class MainWindow(QMainWindow):
         self._arclines_btn.setEnabled(False)
         self._batch_btn.setEnabled(False)
         self._alignment_btn.setEnabled(False)
+        self._align_batch_check.setEnabled(False)
         self._grid_check.setEnabled(False)
         self._segments_check.setEnabled(False)
         self._image_label.setCursor(Qt.ArrowCursor)
@@ -1949,6 +2092,7 @@ class MainWindow(QMainWindow):
         self._arclines_btn.setEnabled(True)
         self._batch_btn.setEnabled(True)
         self._alignment_btn.setEnabled(True)
+        self._align_batch_check.setEnabled(True)
         self._grid_check.setEnabled(True)
         self._segments_check.setEnabled(True)
         self._image_label.setCursor(Qt.CrossCursor)
@@ -2156,6 +2300,7 @@ class MainWindow(QMainWindow):
         # Save detection filter values
         det_cfg = self._config.get('detection', {})
         det_cfg.update(self._results_window.filter_values())
+        det_cfg['alignment_enabled'] = self._align_batch_check.isChecked()
         self._config['detection'] = det_cfg
 
         # Save feature pair configuration
@@ -2245,6 +2390,8 @@ def main():
     window._settings_window.show()
     window._results_window.set_filters_from_config(
         config.get('detection', {}))
+    window._align_batch_check.setChecked(
+        config.get('detection', {}).get('alignment_enabled', False))
 
     # Load stored feature pair configuration
     window._pair_list_window.load_config(
