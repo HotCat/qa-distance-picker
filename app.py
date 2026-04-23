@@ -35,6 +35,10 @@ from detect_lines import (
     render_annotations, compute_feature_distance, compute_feature_pair_points,
     fuzzy_match_template_pairs, detect_lines_and_arcs,
 )
+from debug_overlay import (
+    draw_grid_overlay, draw_edge_segments,
+    compute_grid_cell, compute_edge_segments,
+)
 
 
 def _app_dir() -> str:
@@ -190,6 +194,7 @@ class ResultsWindow(QWidget):
     item_selected = Signal(str, str)  # ("line"|"arc", id) or ("", "")
     pair_added = Signal(str, str, str, str)  # (type_a, id_a, type_b, id_b)
     filters_changed = Signal()
+    redetect_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -267,6 +272,15 @@ class ResultsWindow(QWidget):
         self._tree.setSelectionMode(QTreeWidget.ExtendedSelection)
         self._tree.itemSelectionChanged.connect(self._on_selection_changed)
         layout.addWidget(self._tree)
+
+        # Redetect button
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        self._redetect_btn = QPushButton("Redetect")
+        self._redetect_btn.setToolTip("Grab a fresh frame and re-run detection")
+        self._redetect_btn.clicked.connect(self._on_redetect_clicked)
+        btn_row.addWidget(self._redetect_btn)
+        layout.addLayout(btn_row)
 
     def _on_filter_changed(self):
         if self._block_filters or self._full_result is None:
@@ -365,6 +379,15 @@ class ResultsWindow(QWidget):
         self._full_result = result
         self._apply_filters()
 
+    def _on_redetect_clicked(self):
+        self._redetect_btn.setEnabled(False)
+        self._redetect_btn.setText("Detecting...")
+        self.redetect_requested.emit()
+
+    def reset_redetect_button(self):
+        self._redetect_btn.setEnabled(True)
+        self._redetect_btn.setText("Redetect")
+
 
 class PairListWindow(QWidget):
     """Floating window with feature pair table and tolerance controls.
@@ -383,6 +406,7 @@ class PairListWindow(QWidget):
         self._all_configs: list[dict] = []  # each: {'name': str, 'pairs': list[FeaturePair]}
         self._current_index: int = -1  # -1 means new/unsaved config
         self._block_combo: bool = False
+        self._last_matches: list | None = None
         self._build_ui()
 
     def _build_ui(self):
@@ -613,13 +637,23 @@ class PairListWindow(QWidget):
         # Emit full config list for saving
         self.config_confirmed.emit(self.get_config_list())
 
-    def update_distances(self, lines, arcs, pixel_size_mm):
-        """Re-compute distances for current config when detection results arrive."""
-        for pair in self._pairs:
-            dist = compute_feature_distance(
-                pair.type_a, pair.id_a, pair.type_b, pair.id_b,
-                lines, arcs, pixel_size_mm)
-            pair.distance_mm = dist if dist is not None else 0.0
+    def update_distances(self, lines, arcs, pixel_size_mm, image_bgr, config):
+        """Re-compute distances for current config using fuzzy matching."""
+        if not self._pairs:
+            return
+        img_h, img_w = image_bgr.shape[:2]
+        det_cfg = config.get('detection', {})
+        matches = fuzzy_match_template_pairs(
+            self._pairs, lines, arcs,
+            img_w, img_h, pixel_size_mm,
+            det_cfg.get('edge_segment_mm', 10.0),
+            det_cfg.get('grid_size_mm', 5.0),
+        )
+        # matches: list of (distance_mm | None, FeaturePair, pt_a, pt_b, det_a, det_b)
+        for i, (dist, pair, pt_a, pt_b, det_a, det_b) in enumerate(matches):
+            if i < len(self._pairs):
+                self._pairs[i].distance_mm = dist if dist is not None else 0.0
+        self._last_matches = matches
         self._refresh_table()
 
     def load_config(self, config_list: list):
@@ -738,6 +772,7 @@ class BatchInspectWindow(QWidget):
     """Floating window for batch inspection against saved templates."""
 
     inspect_requested = Signal()  # emitted when user clicks Inspect
+    pair_row_selected = Signal(int)  # -1 for no selection, >= 0 for row index
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -781,6 +816,7 @@ class BatchInspectWindow(QWidget):
         self._table.setAlternatingRowColors(True)
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
         self._table.setSelectionMode(QTableWidget.SingleSelection)
+        self._table.currentCellChanged.connect(self._on_row_changed)
         layout.addWidget(self._table)
 
         # Inspect button
@@ -906,6 +942,13 @@ class BatchInspectWindow(QWidget):
         self._inspect_btn.setEnabled(True)
         self._inspect_btn.setText("Inspect")
 
+    def _on_row_changed(self, row: int, _col: int, _prev_row: int, _prev_col: int):
+        """Emit row selection for overlay annotation."""
+        if 0 <= row < len(self._results):
+            self.pair_row_selected.emit(row)
+        else:
+            self.pair_row_selected.emit(-1)
+
     def reset_button(self):
         """Re-enable inspect button after error."""
         self._inspect_btn.setEnabled(True)
@@ -946,10 +989,14 @@ class MainWindow(QMainWindow):
         self._display_pixmap: QPixmap | None = None  # prevent GC
         self._calib_pending: bool = False
         self._batch_inspect_pending: bool = False
+        self._redetect_pending: bool = False
         self._active_worker: QThread | None = None
         self._template_line_grid: dict | None = None
         self._template_arc_grid: dict | None = None
         self._last_arclines_result: LinesArcsResult | None = None
+        self._last_batch_results: list | None = None
+        self._show_grid_overlay: bool = False
+        self._show_segments_overlay: bool = False
 
         self._build_ui()
         self._connect_signals()
@@ -965,7 +1012,9 @@ class MainWindow(QMainWindow):
         self._image_label.setAlignment(Qt.AlignCenter)
         self._image_label.setStyleSheet("background-color: #1a1a1a;")
         self._image_label.setCursor(Qt.CrossCursor)
+        self._image_label.setMouseTracking(True)
         self._image_label.mousePressEvent = self._on_image_click
+        self._image_label.mouseMoveEvent = self._on_image_mouse_move
         self.setCentralWidget(self._image_label)
 
         # Toolbar
@@ -1006,6 +1055,16 @@ class MainWindow(QMainWindow):
         self._arclines_btn.setEnabled(False)
         toolbar.addWidget(self._arclines_btn)
 
+        self._grid_check = QCheckBox("Grid")
+        self._grid_check.setToolTip("Show grid cell overlay for arc ID visualization")
+        self._grid_check.setEnabled(False)  # Disabled until processing mode
+        toolbar.addWidget(self._grid_check)
+
+        self._segments_check = QCheckBox("Segments")
+        self._segments_check.setToolTip("Show edge segment overlay for line ID visualization")
+        self._segments_check.setEnabled(False)  # Disabled until processing mode
+        toolbar.addWidget(self._segments_check)
+
         self._batch_btn = QPushButton("BatchInspect")
         self._batch_btn.setEnabled(False)
         toolbar.addWidget(self._batch_btn)
@@ -1045,6 +1104,8 @@ class MainWindow(QMainWindow):
         self._batch_btn.clicked.connect(self._on_batch_inspect_clicked)
         self._batch_inspect_window.inspect_requested.connect(
             self._on_inspect_requested)
+        self._batch_inspect_window.pair_row_selected.connect(
+            self._on_batch_row_selected)
 
         # Settings → camera
         self._settings_window.settings_changed.connect(
@@ -1057,6 +1118,12 @@ class MainWindow(QMainWindow):
             self._on_pair_added)
         self._results_window.filters_changed.connect(
             self._on_filters_changed)
+        self._results_window.redetect_requested.connect(
+            self._on_redetect_requested)
+
+        # Debug overlay checkboxes
+        self._grid_check.stateChanged.connect(self._on_grid_check_changed)
+        self._segments_check.stateChanged.connect(self._on_segments_check_changed)
 
         # Pair list window → config save + measurement overlay
         self._pair_list_window.config_confirmed.connect(
@@ -1081,12 +1148,19 @@ class MainWindow(QMainWindow):
         elif self._batch_inspect_pending:
             self._batch_inspect_pending = False
             self._run_batch_inspect(frame)
+        elif self._redetect_pending:
+            self._redetect_pending = False
+            self._run_redetect(frame)
         else:
             self._enter_processing_with_image(frame)
 
     @Slot(str)
     def _on_camera_error(self, msg: str):
         self._status_label.setText(f"Camera error: {msg}")
+        self._batch_inspect_pending = False
+        self._redetect_pending = False
+        self._batch_inspect_window.reset_button()
+        self._results_window.reset_redetect_button()
 
     # ── Slots: mode and buttons ─────────────────────────────────────
 
@@ -1148,6 +1222,21 @@ class MainWindow(QMainWindow):
         self._calib_pending = True
         self._status_label.setText("Capturing chessboard frame...")
         self._camera.software_trigger()
+
+    @Slot()
+    def _on_redetect_requested(self):
+        """User pressed Redetect — grab fresh frame and re-run detection."""
+        if self._current_mode != "processing":
+            self._mode_combo.setCurrentIndex(1)
+        self._status_label.setText("Redetect: capturing fresh frame...")
+        self._redetect_pending = True
+        self._camera.software_trigger()
+
+    def _run_redetect(self, frame: np.ndarray):
+        """Run detection pipeline on a freshly grabbed frame."""
+        self._enter_processing_with_image(frame)
+        self._last_arclines_result = None
+        self._on_arclines_clicked()
 
     @Slot()
     def _on_arclines_clicked(self):
@@ -1220,10 +1309,12 @@ class MainWindow(QMainWindow):
 
         self._results_window.update_results(result)
         self._results_window.show()
+        self._pair_list_window.show()
 
-        # Re-measure stored pairs with new geometry
+        # Re-measure stored pairs with new geometry (fuzzy matching)
         self._pair_list_window.update_distances(
-            result.lines, result.arcs, self._processor.pixel_size)
+            result.lines, result.arcs, self._processor.pixel_size,
+            self._proc_state.image_bgr, self._config)
 
         self._render_arclines()
 
@@ -1231,12 +1322,14 @@ class MainWindow(QMainWindow):
         n_arcs = len(result.arcs)
         self._status_label.setText(
             f"Detected {n_lines} lines, {n_arcs} arcs")
+        self._results_window.reset_redetect_button()
 
     @Slot(str)
     def _on_worker_error(self, msg: str):
         """Handle errors from background workers."""
         self._active_worker = None
         self._status_label.setText(f"Error: {msg}")
+        self._results_window.reset_redetect_button()
 
     # ── Batch inspect ────────────────────────────────────────────────
 
@@ -1253,12 +1346,17 @@ class MainWindow(QMainWindow):
         self._batch_inspect_window.show()
 
     def _on_inspect_requested(self):
-        """User pressed Inspect — refresh config, grab frame and run inspection."""
+        """User pressed Inspect — switch to processing mode, grab frame and run inspection."""
         # Refresh template data in case new pairs were added
         configs = {}
         for cfg in self._pair_list_window._all_configs:
             configs[cfg['name']] = cfg['pairs']
         self._batch_inspect_window.set_config_names(configs)
+
+        # Auto-switch to Image Processing mode if in Live View
+        if self._current_mode != "processing":
+            self._mode_combo.setCurrentIndex(1)
+
         self._status_label.setText("Batch inspect: capturing frame...")
         self._batch_inspect_pending = True
         self._camera.software_trigger()
@@ -1308,24 +1406,33 @@ class MainWindow(QMainWindow):
         self._active_worker = None
         self._batch_inspect_window.show_results(results)
 
+        # Store results for row-click annotation
+        self._last_batch_results = results
+
         # Render feature geometry + measurement overlays on current frame
         if self._proc_state and self._proc_state.image_bgr is not None:
             from detect_lines import (render_measurement_overlay, LineResult,
-                                      ArcResult)
+                                      ArcResult, ARC_PALETTE)
             canvas = self._proc_state.image_bgr.copy()
             font = cv2.FONT_HERSHEY_SIMPLEX
 
-            # Draw detected feature geometry first (lines and arcs)
-            for dist, pair, pt_a, pt_b, det_a, det_b in results:
+            for idx, (dist, pair, pt_a, pt_b, det_a, det_b) in enumerate(results):
                 if det_a is None and det_b is None:
                     continue
-                # Color: green if pass, red if fail, yellow if no tolerance
-                if pair.lower_mm == 0 and pair.upper_mm == 0:
-                    feat_color = (0, 255, 255)  # yellow
-                elif dist is not None and pair.lower_mm <= dist <= pair.upper_mm:
-                    feat_color = (0, 200, 0)  # green
-                else:
-                    feat_color = (0, 0, 255)  # red
+                pair_color = ARC_PALETTE[idx % len(ARC_PALETTE)]
+
+                # Dim color for pass/fail status tinting
+                if dist is not None and not (pair.lower_mm == 0 and pair.upper_mm == 0):
+                    if pair.lower_mm <= dist <= pair.upper_mm:
+                        # Pass: keep pair color as-is
+                        pass
+                    else:
+                        # Fail: shift toward red
+                        pair_color = (
+                            min(255, pair_color[0] + 100),
+                            max(0, pair_color[1] - 80),
+                            max(0, pair_color[2] - 80),
+                        )
 
                 for det in (det_a, det_b):
                     if det is None:
@@ -1333,25 +1440,29 @@ class MainWindow(QMainWindow):
                     if isinstance(det, LineResult):
                         p1 = det.start_px.astype(int)
                         p2 = det.end_px.astype(int)
-                        cv2.line(canvas, tuple(p1), tuple(p2), feat_color, 2, cv2.LINE_AA)
-                        cv2.circle(canvas, tuple(p1), 4, feat_color, -1)
-                        cv2.circle(canvas, tuple(p2), 4, feat_color, -1)
+                        cv2.line(canvas, tuple(p1), tuple(p2), pair_color, 2, cv2.LINE_AA)
+                        cv2.circle(canvas, tuple(p1), 4, pair_color, -1)
+                        cv2.circle(canvas, tuple(p2), 4, pair_color, -1)
                     elif isinstance(det, ArcResult):
                         cx, cy = int(det.center_px[0]), int(det.center_px[1])
                         r = int(det.radius_px)
-                        cv2.circle(canvas, (cx, cy), r, feat_color, 2, cv2.LINE_AA)
-                        cv2.circle(canvas, (cx, cy), 3, feat_color, -1)
+                        cv2.circle(canvas, (cx, cy), r, pair_color, 2, cv2.LINE_AA)
+                        cv2.circle(canvas, (cx, cy), 3, pair_color, -1)
 
             # Draw measurement lines on top
-            for dist, pair, pt_a, pt_b, det_a, det_b in results:
+            for idx, (dist, pair, pt_a, pt_b, det_a, det_b) in enumerate(results):
                 if dist is not None and pt_a is not None and pt_b is not None:
-                    if pair.lower_mm == 0 and pair.upper_mm == 0:
-                        color = (0, 255, 255)
-                    elif pair.lower_mm <= dist <= pair.upper_mm:
-                        color = (0, 200, 0)
-                    else:
-                        color = (0, 0, 255)
-                    render_measurement_overlay(canvas, pt_a, pt_b, dist, color)
+                    pair_color = ARC_PALETTE[idx % len(ARC_PALETTE)]
+                    if dist is not None and not (pair.lower_mm == 0 and pair.upper_mm == 0):
+                        if pair.lower_mm <= dist <= pair.upper_mm:
+                            pass
+                        else:
+                            pair_color = (
+                                min(255, pair_color[0] + 100),
+                                max(0, pair_color[1] - 80),
+                                max(0, pair_color[2] - 80),
+                            )
+                    render_measurement_overlay(canvas, pt_a, pt_b, dist, pair_color)
             self._display_image(canvas)
 
         n_pass = sum(1 for dist, pair, _, _, _, _ in results
@@ -1374,6 +1485,61 @@ class MainWindow(QMainWindow):
         self._active_worker = None
         self._status_label.setText(f"Batch inspect error: {msg}")
         self._batch_inspect_window.reset_button()
+
+    @Slot(int)
+    def _on_batch_row_selected(self, row: int):
+        """Batch inspect table row selected — draw red arrow annotation."""
+        if row < 0 or self._last_batch_results is None:
+            # Re-render batch overlay without arrow
+            if self._last_batch_results is not None:
+                self._on_batch_inspect_done(self._last_batch_results)
+            return
+        if row >= len(self._last_batch_results):
+            return
+
+        dist, pair, pt_a, pt_b, det_a, det_b = self._last_batch_results[row]
+        if dist is None or pt_a is None or pt_b is None:
+            return
+
+        # Re-render the full batch overlay first
+        from detect_lines import ARC_PALETTE
+        self._on_batch_inspect_done(self._last_batch_results)
+
+        # Now draw the red arrow perpendicular to the measurement line at midpoint
+        if self._proc_state and self._proc_state.image_bgr is not None:
+            canvas = self._proc_state.image_bgr.copy()
+            # Re-render batch overlay onto this fresh canvas
+            from detect_lines import (render_measurement_overlay, LineResult, ArcResult)
+            for idx, (d, p, pa, pb, da, db) in enumerate(self._last_batch_results):
+                pc = ARC_PALETTE[idx % len(ARC_PALETTE)]
+                if d is not None and not (p.lower_mm == 0 and p.upper_mm == 0):
+                    if not (p.lower_mm <= d <= p.upper_mm):
+                        pc = (min(255, pc[0] + 100), max(0, pc[1] - 80), max(0, pc[2] - 80))
+                for det in (da, db):
+                    if det is None:
+                        continue
+                    if isinstance(det, LineResult):
+                        cv2.line(canvas, tuple(det.start_px.astype(int)),
+                                 tuple(det.end_px.astype(int)), pc, 2, cv2.LINE_AA)
+                    elif isinstance(det, ArcResult):
+                        cv2.circle(canvas, (int(det.center_px[0]), int(det.center_px[1])),
+                                   int(det.radius_px), pc, 2, cv2.LINE_AA)
+                if d is not None and pa is not None and pb is not None:
+                    render_measurement_overlay(canvas, pa, pb, d, pc)
+
+            # Draw red arrow at midpoint perpendicular to measurement line
+            pt_a_int = pt_a.astype(int)
+            pt_b_int = pt_b.astype(int)
+            mid = ((pt_a_int + pt_b_int) // 2).astype(int)
+            direction = (pt_b_int - pt_a_int).astype(float)
+            length = np.linalg.norm(direction)
+            if length > 0:
+                direction = direction / length
+            perp = np.array([-direction[1], direction[0]])
+            arrow_start = (mid + (perp * 40)).astype(int)
+            cv2.arrowedLine(canvas, tuple(arrow_start), tuple(mid),
+                            (0, 0, 255), 3, tipLength=0.4)
+            self._display_image(canvas)
 
     @Slot(str, str, str, str)
     def _on_pair_added(self, type_a: str, id_a: str, type_b: str, id_b: str):
@@ -1417,6 +1583,17 @@ class MainWindow(QMainWindow):
         if row < 0:
             self._render_arclines()
             return
+
+        # Use fuzzy match results if available (preferred over exact lookup)
+        matches = self._pair_list_window._last_matches
+        if matches is not None and 0 <= row < len(matches):
+            dist, pair, pt_a, pt_b, det_a, det_b = matches[row]
+            if dist is not None and pt_a is not None and pt_b is not None:
+                self._render_arclines(
+                    measurement_points=(dist, pt_a, pt_b))
+                return
+
+        # Fallback to exact lookup (for pairs added before any detection run)
         pair = self._pair_list_window.get_pair(row)
         if pair is None or self._last_arclines_result is None:
             self._render_arclines()
@@ -1449,6 +1626,14 @@ class MainWindow(QMainWindow):
     def _render_arclines(self, highlight_type="", highlight_id="",
                          measurement_points=None):
         """Render annotated image from detection data with current filters."""
+        # When debug overlays are active, use the overlay rendering path
+        if self._show_grid_overlay or self._show_segments_overlay:
+            self._refresh_with_overlays(
+                highlight_type=highlight_type,
+                highlight_id=highlight_id,
+                measurement_points=measurement_points)
+            return
+
         result = self._last_arclines_result
         if result is None or self._proc_state is None:
             return
@@ -1469,6 +1654,51 @@ class MainWindow(QMainWindow):
             measurement_points=measurement_points)
         self._display_image(annotated)
 
+    def _refresh_with_overlays(self, highlight_type="", highlight_id="",
+                                measurement_points=None):
+        """Re-render current image with debug overlays + arclines annotations."""
+        if self._proc_state is None or self._proc_state.image_bgr is None:
+            return
+
+        base = self._proc_state.image_bgr.copy()
+        det_cfg = self._config.get('detection', {})
+        pixel_size_mm = self._processor.pixel_size
+
+        if self._show_grid_overlay:
+            base = draw_grid_overlay(
+                base, pixel_size_mm, det_cfg.get('grid_size_mm', 5.0))
+
+        if self._show_segments_overlay:
+            base = draw_edge_segments(
+                base, pixel_size_mm, det_cfg.get('edge_segment_mm', 10.0))
+
+        # Arclines annotations on top of overlays
+        result = self._last_arclines_result
+        if result is not None:
+            fv = self._results_window.filter_values()
+            filtered_lines = [lr for lr in result.lines
+                             if fv['line_min_mm'] <= lr.length_mm <= fv['line_max_mm']]
+            filtered_arcs = [ar for ar in result.arcs
+                            if fv['arc_min_mm'] <= ar.radius_mm <= fv['arc_max_mm']]
+            base = render_annotations(
+                base, filtered_lines, filtered_arcs,
+                highlight_type=highlight_type, highlight_id=highlight_id,
+                measurement_points=measurement_points)
+
+        self._display_image(base)
+
+    @Slot(int)
+    def _on_grid_check_changed(self, state: int):
+        self._show_grid_overlay = bool(state)
+        if self._proc_state and self._proc_state.image_bgr is not None:
+            self._refresh_with_overlays()
+
+    @Slot(int)
+    def _on_segments_check_changed(self, state: int):
+        self._show_segments_overlay = bool(state)
+        if self._proc_state and self._proc_state.image_bgr is not None:
+            self._refresh_with_overlays()
+
     # ── Mode transitions ────────────────────────────────────────────
 
     def _switch_to_live(self):
@@ -1480,6 +1710,8 @@ class MainWindow(QMainWindow):
         self._calib_btn.setEnabled(False)
         self._arclines_btn.setEnabled(False)
         self._batch_btn.setEnabled(False)
+        self._grid_check.setEnabled(False)
+        self._segments_check.setEnabled(False)
         self._image_label.setCursor(Qt.ArrowCursor)
         self._proc_state = None
         self._last_arclines_result = None
@@ -1497,6 +1729,8 @@ class MainWindow(QMainWindow):
         self._calib_btn.setEnabled(True)
         self._arclines_btn.setEnabled(True)
         self._batch_btn.setEnabled(True)
+        self._grid_check.setEnabled(True)
+        self._segments_check.setEnabled(True)
         self._image_label.setCursor(Qt.CrossCursor)
 
         # Switch camera to trigger mode
@@ -1543,67 +1777,42 @@ class MainWindow(QMainWindow):
         if self._proc_state is None or self._proc_state.seg is None:
             return
 
-        # When arclines results are displayed, skip old object-picking
-        if self._last_arclines_result is not None:
+        # Old watershed object-picking replaced by arclines-based measurement.
+        # Clicks are no longer used for distance picking.
+
+    def _on_image_mouse_move(self, event):
+        """Handle mouse hover — show grid cell / edge segment info in status bar."""
+        if self._current_mode != "processing":
+            return
+        if self._proc_state is None or self._proc_state.image_bgr is None:
             return
 
         ix, iy = self._label_to_image(event.position().toPoint())
-        if ix is None:
+        if ix is None or iy is None:
             return
 
-        if self._picker_state == PICK_OBJECT1:
-            label = self._processor.get_label_at(
-                self._proc_state.seg.labels, ix, iy,
-                self._proc_state.seg.region_sizes)
-            if label is None:
-                self._status_label.setText(
-                    "Invalid region — click on an object (not boundary)")
-                return
-            self._proc_state.obj1_id = label
-            self._proc_state.click1 = (ix, iy)
-            self._picker_state = PICK_OBJECT2
-            self._refresh_overlay()
-            self._status_label.setText(
-                f"Object 1: ID={label}. Click on the SECOND object.")
+        img_h, img_w = self._proc_state.image_bgr.shape[:2]
+        det_cfg = self._config.get('detection', {})
+        pixel_size_mm = self._processor.pixel_size
 
-        elif self._picker_state == PICK_OBJECT2:
-            label = self._processor.get_label_at(
-                self._proc_state.seg.labels, ix, iy,
-                self._proc_state.seg.region_sizes)
-            if label is None:
-                self._status_label.setText(
-                    "Invalid region — click on an object (not boundary)")
-                return
-            if label == self._proc_state.obj1_id:
-                self._status_label.setText(
-                    "Same object — click on a DIFFERENT object")
-                return
+        parts = []
 
-            self._proc_state.obj2_id = label
-            self._proc_state.click2 = (ix, iy)
+        # Grid cell
+        grid_size_mm = det_cfg.get('grid_size_mm', 5.0)
+        row, col = compute_grid_cell(ix, iy, pixel_size_mm, grid_size_mm)
+        parts.append(f"Cell: C{row}_{col}")
 
-            # Compute distance
-            self._status_label.setText("Computing distance...")
-            QApplication.processEvents()
+        # Edge segments (always show when in processing mode)
+        segment_mm = det_cfg.get('edge_segment_mm', 10.0)
+        segs = compute_edge_segments(ix, iy, img_w, img_h, pixel_size_mm, segment_mm)
+        parts.append(f"Edges: Up{segs['Up']}/Lo{segs['Lo']}/Le{segs['Le']}/Ri{segs['Ri']}")
 
-            result = self._processor.compute_distance(
-                self._proc_state.image_rgb,
-                self._proc_state.seg.labels,
-                self._proc_state.dip_grey,
-                self._proc_state.obj1_id,
-                self._proc_state.obj2_id,
-            )
-            self._proc_state.result = result
-            self._picker_state = SHOW_RESULT
-            self._refresh_overlay()
+        # Pixel position in mm
+        x_mm = ix * pixel_size_mm
+        y_mm = iy * pixel_size_mm
+        parts.append(f"({x_mm:.2f}, {y_mm:.2f}) mm")
 
-            if result:
-                self._status_label.setText(
-                    f"Distance: {result.distance_mm:.3f} mm  |  "
-                    f"Press Reset to measure again")
-            else:
-                self._status_label.setText(
-                    "Distance computation failed. Press Reset.")
+        self._status_label.setText("  |  ".join(parts))
 
     # ── Rendering ───────────────────────────────────────────────────
 
@@ -1631,6 +1840,10 @@ class MainWindow(QMainWindow):
     def _refresh_overlay(self):
         """Re-render overlays and display."""
         if self._proc_state is None or self._proc_state.image_bgr is None:
+            return
+
+        if self._show_grid_overlay or self._show_segments_overlay:
+            self._refresh_with_overlays()
             return
 
         composited = OverlayRenderer.render(
