@@ -529,6 +529,7 @@ class PairListWindow(QWidget):
         self._sync_current_config()
         # Load selected config
         self._current_index = index
+        self._last_matches = None
         if 0 <= index < len(self._all_configs):
             cfg = self._all_configs[index]
             self._name_edit.setText(cfg['name'])
@@ -539,6 +540,7 @@ class PairListWindow(QWidget):
         """Start a new blank configuration."""
         self._sync_current_config()
         self._current_index = -1
+        self._last_matches = None
         self._temp_pairs: list[FeaturePair] = []
         self._name_edit.clear()
         self._block_combo = True
@@ -552,6 +554,7 @@ class PairListWindow(QWidget):
         if 0 <= self._current_index < len(self._all_configs):
             name = self._all_configs[self._current_index]['name']
             self._all_configs.pop(self._current_index)
+            self._last_matches = None
             self._refresh_combo()
             # Select first remaining config or go to new
             if self._all_configs:
@@ -586,6 +589,7 @@ class PairListWindow(QWidget):
     def add_pair(self, pair: FeaturePair):
         """Add a pair to current config."""
         self._pairs.append(pair)
+        self._last_matches = None
         self._refresh_table()
 
     def _on_row_changed(self, row: int, _col: int, _prev_row: int, _prev_col: int):
@@ -645,6 +649,7 @@ class PairListWindow(QWidget):
         row = self._table.currentRow()
         if 0 <= row < len(self._pairs):
             self._pairs.pop(row)
+            self._last_matches = None
             self._refresh_table()
         self.pair_row_selected.emit(-1)
 
@@ -1261,6 +1266,10 @@ class MainWindow(QMainWindow):
         self._toggle_shortcut = QShortcut(QKeySequence(Qt.Key_T), self)
         self._toggle_shortcut.setContext(Qt.ApplicationShortcut)
 
+        # Inspect shortcut
+        self._inspect_shortcut = QShortcut(QKeySequence(Qt.Key_I), self)
+        self._inspect_shortcut.setContext(Qt.ApplicationShortcut)
+
         toolbar.addSeparator()
 
         self._grab_btn = QPushButton("Grab")
@@ -1341,6 +1350,7 @@ class MainWindow(QMainWindow):
         # UI → actions
         self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         self._toggle_shortcut.activated.connect(self._on_toggle_mode)
+        self._inspect_shortcut.activated.connect(self._on_inspect_requested)
         self._grab_btn.clicked.connect(self._on_grab_clicked)
         self._reset_btn.clicked.connect(self._on_reset)
         self._save_btn.clicked.connect(self._on_save)
@@ -2303,8 +2313,17 @@ class MainWindow(QMainWindow):
         det_cfg['alignment_enabled'] = self._align_batch_check.isChecked()
         self._config['detection'] = det_cfg
 
-        # Save feature pair configuration
-        self._config['feature_pairs'] = self._pair_list_window.get_config_list()
+        # Save feature pair configuration (preserve template metadata)
+        old_cfgs = self._config.get('feature_pairs', [])
+        new_cfgs = self._pair_list_window.get_config_list()
+        for new_cfg in new_cfgs:
+            for old_cfg in old_cfgs:
+                if old_cfg.get('name') == new_cfg.get('name'):
+                    for key in ('template_image', 'template_features'):
+                        if key in old_cfg:
+                            new_cfg[key] = old_cfg[key]
+                    break
+        self._config['feature_pairs'] = new_cfgs
 
         config_path = os.path.join(_app_dir(), 'config.yaml')
         try:
