@@ -1944,9 +1944,18 @@ class MainWindow(QMainWindow):
 
     def _on_pair_config_confirmed(self, configs: list):
         """User confirmed pair configuration — save all configs and template images."""
+        # Preserve template metadata before overwriting with clean list
+        old_cfgs = self._config.get('feature_pairs', [])
+        for new_cfg in configs:
+            for old_cfg in old_cfgs:
+                if old_cfg.get('name') == new_cfg.get('name'):
+                    for key in ('template_image', 'template_features'):
+                        if key in old_cfg:
+                            new_cfg[key] = old_cfg[key]
+                    break
         self._config['feature_pairs'] = configs
 
-        # Save template image and features for the current config
+        # Save/update template image and features for the current config
         if (self._proc_state and self._proc_state.image_bgr is not None
                 and self._pair_list_window._current_index >= 0):
             cfg_name = self._pair_list_window._name_edit.text().strip() or "unnamed"
