@@ -1,0 +1,8 @@
+PySide6
+diplib
+opencv-python
+numpy
+pyyaml
+pillow
+scipy
+pyinstaller
