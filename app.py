@@ -99,7 +99,7 @@ class CameraSettingsWindow(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Camera Settings")
+        self.setWindowTitle("相机设置")
         self.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint)
         self.setMinimumWidth(320)
         self._block_signals = False
@@ -109,7 +109,7 @@ class CameraSettingsWindow(QWidget):
         layout = QFormLayout(self)
 
         # Auto-exposure
-        self._ae_check = QCheckBox("Auto Exposure")
+        self._ae_check = QCheckBox("自动曝光")
         self._ae_check.stateChanged.connect(self._on_setting_changed)
         layout.addRow(self._ae_check)
 
@@ -127,7 +127,7 @@ class CameraSettingsWindow(QWidget):
         exp_row = QHBoxLayout()
         exp_row.addWidget(self._exposure_slider, 1)
         exp_row.addWidget(self._exposure_spin)
-        layout.addRow("Exposure:", exp_row)
+        layout.addRow("曝光:", exp_row)
 
         # Gamma
         self._gamma_slider = QSlider(Qt.Horizontal)
@@ -138,7 +138,7 @@ class CameraSettingsWindow(QWidget):
         gamma_row = QHBoxLayout()
         gamma_row.addWidget(self._gamma_slider, 1)
         gamma_row.addWidget(self._gamma_spin)
-        layout.addRow("Gamma:", gamma_row)
+        layout.addRow("伽马:", gamma_row)
 
         # Contrast
         self._contrast_slider = QSlider(Qt.Horizontal)
@@ -149,7 +149,7 @@ class CameraSettingsWindow(QWidget):
         contrast_row = QHBoxLayout()
         contrast_row.addWidget(self._contrast_slider, 1)
         contrast_row.addWidget(self._contrast_spin)
-        layout.addRow("Contrast:", contrast_row)
+        layout.addRow("对比度:", contrast_row)
 
         # Analog Gain
         self._gain_slider = QSlider(Qt.Horizontal)
@@ -160,14 +160,14 @@ class CameraSettingsWindow(QWidget):
         gain_row = QHBoxLayout()
         gain_row.addWidget(self._gain_slider, 1)
         gain_row.addWidget(self._gain_spin)
-        layout.addRow("Analog Gain:", gain_row)
+        layout.addRow("模拟增益:", gain_row)
 
         # Mirror checkboxes
-        self._reverse_x_check = QCheckBox("Reverse X (Horizontal Mirror)")
+        self._reverse_x_check = QCheckBox("水平镜像 (Reverse X)")
         self._reverse_x_check.stateChanged.connect(self._on_setting_changed)
         layout.addRow(self._reverse_x_check)
 
-        self._reverse_y_check = QCheckBox("Reverse Y (Vertical Mirror)")
+        self._reverse_y_check = QCheckBox("垂直镜像 (Reverse Y)")
         self._reverse_y_check.stateChanged.connect(self._on_setting_changed)
         layout.addRow(self._reverse_y_check)
 
@@ -238,7 +238,7 @@ class ResultsWindow(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Detection Results")
+        self.setWindowTitle("检测结果")
         self.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint)
         self.setMinimumSize(480, 350)
         self._full_result: LinesArcsResult | None = None
@@ -253,7 +253,7 @@ class ResultsWindow(QWidget):
         filter_layout = QHBoxLayout()
 
         # Line length filter
-        filter_layout.addWidget(QLabel("Line len:"))
+        filter_layout.addWidget(QLabel("线长:"))
         self._line_min_spin = QDoubleSpinBox()
         self._line_min_spin.setRange(0.0, 500.0)
         self._line_min_spin.setDecimals(1)
@@ -276,7 +276,7 @@ class ResultsWindow(QWidget):
         filter_layout.addSpacing(12)
 
         # Arc radius filter
-        filter_layout.addWidget(QLabel("Arc r:"))
+        filter_layout.addWidget(QLabel("弧半径:"))
         self._arc_min_spin = QDoubleSpinBox()
         self._arc_min_spin.setRange(0.0, 500.0)
         self._arc_min_spin.setDecimals(1)
@@ -301,7 +301,7 @@ class ResultsWindow(QWidget):
 
         # ── Tree ────────────────────────────────────────────────────
         self._tree = QTreeWidget()
-        self._tree.setHeaderLabels(["ID", "Category", "Length (mm)", "Angle (°)", "Radius (mm)"])
+        self._tree.setHeaderLabels(["ID", "类别", "长度 (mm)", "角度 (°)", "半径 (mm)"])
         header = self._tree.header()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
@@ -316,8 +316,8 @@ class ResultsWindow(QWidget):
         # Redetect button
         btn_row = QHBoxLayout()
         btn_row.addStretch()
-        self._redetect_btn = QPushButton("Redetect")
-        self._redetect_btn.setToolTip("Grab a fresh frame and re-run detection")
+        self._redetect_btn = QPushButton("重新检测")
+        self._redetect_btn.setToolTip("重新采集一帧并运行检测")
         self._redetect_btn.clicked.connect(self._on_redetect_clicked)
         btn_row.addWidget(self._redetect_btn)
         layout.addLayout(btn_row)
@@ -347,7 +347,7 @@ class ResultsWindow(QWidget):
         font = self._tree.font()
         font.setBold(True)
 
-        lines_item = QTreeWidgetItem(self._tree, [f"Lines ({len(lines)})", "", "", "", ""])
+        lines_item = QTreeWidgetItem(self._tree, [f"直线 ({len(lines)})", "", "", "", ""])
         lines_item.setExpanded(True)
         lines_item.setFont(0, font)
         for lr in lines:
@@ -358,7 +358,7 @@ class ResultsWindow(QWidget):
                 "",
             ])
 
-        arcs_item = QTreeWidgetItem(self._tree, [f"Curves ({len(arcs)})", "", "", "", ""])
+        arcs_item = QTreeWidgetItem(self._tree, [f"曲线 ({len(arcs)})", "", "", "", ""])
         arcs_item.setExpanded(True)
         arcs_item.setFont(0, font)
         for ar in arcs:
@@ -394,7 +394,7 @@ class ResultsWindow(QWidget):
             types_ids = []
             for item in leaf_items:
                 parent = item.parent().text(0)
-                type_ = "line" if parent.startswith("Lines") else "arc"
+                type_ = "line" if parent.startswith("直线") else "arc"
                 types_ids.append((type_, item.text(0)))
             self.pair_added.emit(
                 types_ids[0][0], types_ids[0][1],
@@ -406,9 +406,9 @@ class ResultsWindow(QWidget):
             item = leaf_items[0]
             item_id = item.text(0)
             parent_text = item.parent().text(0)
-            if parent_text.startswith("Lines"):
+            if parent_text.startswith("直线"):
                 self.item_selected.emit("line", item_id)
-            elif parent_text.startswith("Curves"):
+            elif parent_text.startswith("曲线"):
                 self.item_selected.emit("arc", item_id)
             else:
                 self.item_selected.emit("", "")
@@ -421,12 +421,12 @@ class ResultsWindow(QWidget):
 
     def _on_redetect_clicked(self):
         self._redetect_btn.setEnabled(False)
-        self._redetect_btn.setText("Detecting...")
+        self._redetect_btn.setText("检测中...")
         self.redetect_requested.emit()
 
     def reset_redetect_button(self):
         self._redetect_btn.setEnabled(True)
-        self._redetect_btn.setText("Redetect")
+        self._redetect_btn.setText("重新检测")
 
 
 class PairListWindow(QWidget):
@@ -440,7 +440,7 @@ class PairListWindow(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Feature Pair Measurements")
+        self.setWindowTitle("特征对测量")
         self.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint)
         self.setMinimumSize(600, 350)
         self._all_configs: list[dict] = []  # each: {'name': str, 'pairs': list[FeaturePair]}
@@ -454,17 +454,17 @@ class PairListWindow(QWidget):
 
         # Config selector row
         selector_row = QHBoxLayout()
-        selector_row.addWidget(QLabel("Select:"))
+        selector_row.addWidget(QLabel("选择:"))
         self._config_combo = QComboBox()
         self._config_combo.setMinimumWidth(150)
         self._config_combo.currentIndexChanged.connect(self._on_config_selected)
         selector_row.addWidget(self._config_combo)
 
-        self._new_btn = QPushButton("New")
+        self._new_btn = QPushButton("新建")
         self._new_btn.clicked.connect(self._on_new_config)
         selector_row.addWidget(self._new_btn)
 
-        self._delete_config_btn = QPushButton("Delete Config")
+        self._delete_config_btn = QPushButton("删除配置")
         self._delete_config_btn.clicked.connect(self._on_delete_config)
         selector_row.addWidget(self._delete_config_btn)
         selector_row.addStretch()
@@ -472,9 +472,9 @@ class PairListWindow(QWidget):
 
         # Name input row
         name_row = QHBoxLayout()
-        name_row.addWidget(QLabel("Name:"))
+        name_row.addWidget(QLabel("名称:"))
         self._name_edit = QLineEdit()
-        self._name_edit.setPlaceholderText("Enter configuration name")
+        self._name_edit.setPlaceholderText("输入配置名称")
         name_row.addWidget(self._name_edit)
         layout.addLayout(name_row)
 
@@ -482,8 +482,8 @@ class PairListWindow(QWidget):
         self._table = QTableWidget()
         self._table.setColumnCount(5)
         self._table.setHorizontalHeaderLabels([
-            "Feature A", "Feature B", "Distance (mm)",
-            "Lower (mm)", "Upper (mm)",
+            "特征 A", "特征 B", "距离 (mm)",
+            "下限 (mm)", "上限 (mm)",
         ])
         header = self._table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Interactive)
@@ -502,11 +502,11 @@ class PairListWindow(QWidget):
 
         # Buttons
         btn_row = QHBoxLayout()
-        self._delete_btn = QPushButton("Delete Row")
+        self._delete_btn = QPushButton("删除行")
         self._delete_btn.clicked.connect(self._on_delete_row)
         btn_row.addWidget(self._delete_btn)
         btn_row.addStretch()
-        self._confirm_btn = QPushButton("Confirm")
+        self._confirm_btn = QPushButton("确认")
         self._confirm_btn.clicked.connect(self._on_confirm)
         btn_row.addWidget(self._confirm_btn)
         layout.addLayout(btn_row)
@@ -656,7 +656,7 @@ class PairListWindow(QWidget):
     def _on_confirm(self):
         """Confirm current config — save/update in _all_configs."""
         self._sync_bounds_from_table()
-        name = self._name_edit.text().strip() or "unnamed"
+        name = self._name_edit.text().strip() or "未命名"
         pairs_copy = self._pairs.copy()
 
         # Find existing config with this name
@@ -864,7 +864,7 @@ class BatchInspectWorker(QThread):
             )
             self.done.emit(matches)
         except Exception as e:
-            self.error.emit(f"Batch inspect failed: {e}")
+            self.error.emit(f"批量检测失败: {e}")
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -879,7 +879,7 @@ class BatchInspectWindow(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Batch Inspect")
+        self.setWindowTitle("批量检测")
         self.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint)
         self.setMinimumSize(550, 350)
         self._results: list[tuple[float | None, FeaturePair]] = []
@@ -891,7 +891,7 @@ class BatchInspectWindow(QWidget):
 
         # Template selector
         selector_row = QHBoxLayout()
-        selector_row.addWidget(QLabel("Template:"))
+        selector_row.addWidget(QLabel("模板:"))
         self._template_combo = QComboBox()
         self._template_combo.setMinimumWidth(150)
         self._template_combo.currentTextChanged.connect(self._on_template_changed)
@@ -903,8 +903,8 @@ class BatchInspectWindow(QWidget):
         self._table = QTableWidget()
         self._table.setColumnCount(6)
         self._table.setHorizontalHeaderLabels([
-            "Feature A", "Feature B", "Distance (mm)",
-            "Lower (mm)", "Upper (mm)", "Pass",
+            "特征 A", "特征 B", "距离 (mm)",
+            "下限 (mm)", "上限 (mm)", "结果",
         ])
         header = self._table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Interactive)
@@ -925,7 +925,7 @@ class BatchInspectWindow(QWidget):
         # Inspect button
         btn_row = QHBoxLayout()
         btn_row.addStretch()
-        self._inspect_btn = QPushButton("Inspect")
+        self._inspect_btn = QPushButton("检测")
         self._inspect_btn.clicked.connect(self._on_inspect_clicked)
         btn_row.addWidget(self._inspect_btn)
         layout.addLayout(btn_row)
@@ -986,7 +986,7 @@ class BatchInspectWindow(QWidget):
     def _on_inspect_clicked(self):
         """Notify MainWindow to grab frame and run inspection."""
         self._inspect_btn.setEnabled(False)
-        self._inspect_btn.setText("Inspecting...")
+        self._inspect_btn.setText("检测中...")
         self.inspect_requested.emit()
 
     def show_results(self, results: list):
@@ -1043,7 +1043,7 @@ class BatchInspectWindow(QWidget):
 
         # Re-enable button
         self._inspect_btn.setEnabled(True)
-        self._inspect_btn.setText("Inspect")
+        self._inspect_btn.setText("检测")
 
     def _on_row_changed(self, row: int, _col: int, _prev_row: int, _prev_col: int):
         """Emit row selection for overlay annotation."""
@@ -1055,7 +1055,7 @@ class BatchInspectWindow(QWidget):
     def reset_button(self):
         """Re-enable inspect button after error."""
         self._inspect_btn.setEnabled(True)
-        self._inspect_btn.setText("Inspect")
+        self._inspect_btn.setText("检测")
 
 
 class ProcessingState:
@@ -1107,7 +1107,7 @@ class AlignmentWorker(QThread):
             else:
                 self.done.emit(result)
         except Exception as e:
-            self.error.emit(f"Alignment failed: {e}")
+            self.error.emit(f"对齐失败: {e}")
 
 
 class AlignmentWindow(QWidget):
@@ -1117,7 +1117,7 @@ class AlignmentWindow(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Alignment Playground")
+        self.setWindowTitle("对齐实验")
         self.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint)
         self.setMinimumSize(400, 300)
         self._build_ui()
@@ -1126,56 +1126,56 @@ class AlignmentWindow(QWidget):
         layout = QVBoxLayout(self)
 
         # Status label
-        self._status = QLabel("Need both template and detected features.")
+        self._status = QLabel("需要模板特征和当前检测特征。")
         self._status.setWordWrap(True)
         layout.addWidget(self._status)
 
         # RANSAC parameters
-        param_group = QGroupBox("RANSAC Parameters")
+        param_group = QGroupBox("RANSAC 参数")
         param_layout = QFormLayout(param_group)
 
         self._iter_spin = QSpinBox()
         self._iter_spin.setRange(10, 1000)
         self._iter_spin.setValue(200)
-        self._iter_spin.setToolTip("Number of RANSAC iterations")
-        param_layout.addRow("Iterations:", self._iter_spin)
+        self._iter_spin.setToolTip("RANSAC 迭代次数")
+        param_layout.addRow("迭代次数:", self._iter_spin)
 
         self._threshold_spin = QDoubleSpinBox()
         self._threshold_spin.setRange(0.5, 30.0)
         self._threshold_spin.setValue(5.0)
         self._threshold_spin.setSingleStep(0.5)
         self._threshold_spin.setSuffix(" mm")
-        self._threshold_spin.setToolTip("Max distance for inlier classification")
-        param_layout.addRow("Inlier threshold:", self._threshold_spin)
+        self._threshold_spin.setToolTip("内点分类最大距离")
+        param_layout.addRow("内点阈值:", self._threshold_spin)
 
         layout.addWidget(param_group)
 
         # Results
-        results_group = QGroupBox("Results")
+        results_group = QGroupBox("结果")
         results_layout = QFormLayout(results_group)
 
         self._rotation_label = QLabel("—")
-        results_layout.addRow("Rotation:", self._rotation_label)
+        results_layout.addRow("旋转:", self._rotation_label)
 
         self._translation_label = QLabel("—")
-        results_layout.addRow("Translation:", self._translation_label)
+        results_layout.addRow("平移:", self._translation_label)
 
         self._inliers_label = QLabel("—")
-        results_layout.addRow("Inliers:", self._inliers_label)
+        results_layout.addRow("内点数:", self._inliers_label)
 
         self._rms_label = QLabel("—")
-        results_layout.addRow("Residual RMS:", self._rms_label)
+        results_layout.addRow("残差 RMS:", self._rms_label)
 
         layout.addWidget(results_group)
 
         # Align button
-        self._align_btn = QPushButton("Align")
+        self._align_btn = QPushButton("对齐")
         self._align_btn.clicked.connect(self._on_align_clicked)
         layout.addWidget(self._align_btn)
 
     def _on_align_clicked(self):
         self._align_btn.setEnabled(False)
-        self._align_btn.setText("Computing...")
+        self._align_btn.setText("计算中...")
         self.align_requested.emit()
 
     def get_params(self) -> dict:
@@ -1186,7 +1186,7 @@ class AlignmentWindow(QWidget):
 
     def show_results(self, result: AlignmentResult):
         t = result.transform
-        self._rotation_label.setText(f"{t.rotation_deg:.2f} deg")
+        self._rotation_label.setText(f"{t.rotation_deg:.2f}°")
         self._translation_label.setText(
             f"({t.translation_mm[0]:.2f}, {t.translation_mm[1]:.2f}) mm")
         self._inliers_label.setText(f"{result.inlier_count}")
@@ -1198,7 +1198,7 @@ class AlignmentWindow(QWidget):
 
     def reset_button(self):
         self._align_btn.setEnabled(True)
-        self._align_btn.setText("Align")
+        self._align_btn.setText("对齐")
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1239,7 +1239,7 @@ class MainWindow(QMainWindow):
     # ── UI construction ─────────────────────────────────────────────
 
     def _build_ui(self):
-        self.setWindowTitle("Watershed Distance Picker")
+        self.setWindowTitle("距离测量质检系统")
         self.setMinimumSize(800, 600)
 
         # Central image display
@@ -1258,7 +1258,7 @@ class MainWindow(QMainWindow):
         self.addToolBar(toolbar)
 
         self._mode_combo = QComboBox()
-        self._mode_combo.addItems(["Live View", "Image Processing"])
+        self._mode_combo.addItems(["实时预览", "图像处理"])
         self._mode_combo.setMinimumWidth(150)
         toolbar.addWidget(self._mode_combo)
 
@@ -1272,56 +1272,56 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        self._grab_btn = QPushButton("Grab")
+        self._grab_btn = QPushButton("采集")
         self._grab_btn.setEnabled(False)
         toolbar.addWidget(self._grab_btn)
 
-        self._reset_btn = QPushButton("Reset")
+        self._reset_btn = QPushButton("重置")
         self._reset_btn.setEnabled(False)
         toolbar.addWidget(self._reset_btn)
 
-        self._save_btn = QPushButton("Save")
+        self._save_btn = QPushButton("保存")
         self._save_btn.setEnabled(False)
         toolbar.addWidget(self._save_btn)
 
         toolbar.addSeparator()
 
-        self._calib_btn = QPushButton("Calibration")
+        self._calib_btn = QPushButton("标定")
         self._calib_btn.setEnabled(False)
         toolbar.addWidget(self._calib_btn)
 
-        self._arclines_btn = QPushButton("Arclines")
+        self._arclines_btn = QPushButton("线弧检测")
         self._arclines_btn.setEnabled(False)
         toolbar.addWidget(self._arclines_btn)
 
-        self._grid_check = QCheckBox("Grid")
-        self._grid_check.setToolTip("Show grid cell overlay for arc ID visualization")
+        self._grid_check = QCheckBox("网格")
+        self._grid_check.setToolTip("显示网格单元叠加层，用于弧 ID 可视化")
         self._grid_check.setEnabled(False)  # Disabled until processing mode
         toolbar.addWidget(self._grid_check)
 
-        self._segments_check = QCheckBox("Segments")
-        self._segments_check.setToolTip("Show edge segment overlay for line ID visualization")
+        self._segments_check = QCheckBox("段")
+        self._segments_check.setToolTip("显示边缘段叠加层，用于线 ID 可视化")
         self._segments_check.setEnabled(False)  # Disabled until processing mode
         toolbar.addWidget(self._segments_check)
 
-        self._batch_btn = QPushButton("BatchInspect")
+        self._batch_btn = QPushButton("批量检测")
         self._batch_btn.setEnabled(False)
         toolbar.addWidget(self._batch_btn)
 
-        self._align_batch_check = QCheckBox("Align")
+        self._align_batch_check = QCheckBox("对齐")
         self._align_batch_check.setToolTip(
-            "Enable RANSAC alignment before batch metrology matching")
+            "批量检测前启用 RANSAC 对齐")
         self._align_batch_check.setEnabled(False)
         toolbar.addWidget(self._align_batch_check)
 
-        self._alignment_btn = QPushButton("Alignment")
+        self._alignment_btn = QPushButton("对齐实验")
         self._alignment_btn.setEnabled(False)
         self._alignment_btn.setToolTip(
-            "RANSAC rigid registration between template and product features")
+            "模板与产品特征的 RANSAC 刚体配准")
         toolbar.addWidget(self._alignment_btn)
 
         # Status bar
-        self._status_label = QLabel("No camera connected")
+        self._status_label = QLabel("未连接相机")
         self.statusBar().addWidget(self._status_label, 1)
 
         # Camera settings window (floating)
@@ -1414,7 +1414,7 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_camera_error(self, msg: str):
-        self._status_label.setText(f"Camera error: {msg}")
+        self._status_label.setText(f"相机错误: {msg}")
         self._batch_inspect_pending = False
         self._redetect_pending = False
         self._batch_inspect_window.reset_button()
@@ -1438,7 +1438,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_grab_clicked(self):
         """Grab a new frame via software trigger."""
-        self._status_label.setText("Grabbing frame...")
+        self._status_label.setText("正在采集帧...")
         self._camera.software_trigger()
 
     @Slot()
@@ -1476,13 +1476,13 @@ class MainWindow(QMainWindow):
             )
             path = "distance_result.png"
             cv2.imwrite(path, composited)
-            self._status_label.setText(f"Saved to {path}")
+            self._status_label.setText(f"已保存至 {path}")
 
     @Slot()
     def _on_calib_clicked(self):
         """Capture a chessboard frame and run calibration."""
         self._calib_pending = True
-        self._status_label.setText("Capturing chessboard frame...")
+        self._status_label.setText("正在采集标定板帧...")
         self._camera.software_trigger()
 
     @Slot()
@@ -1490,7 +1490,7 @@ class MainWindow(QMainWindow):
         """User pressed Redetect — grab fresh frame and re-run detection."""
         if self._current_mode != "processing":
             self._mode_combo.setCurrentIndex(1)
-        self._status_label.setText("Redetect: capturing fresh frame...")
+        self._status_label.setText("重新检测: 正在采集帧...")
         self._redetect_pending = True
         self._camera.software_trigger()
 
@@ -1504,9 +1504,9 @@ class MainWindow(QMainWindow):
     def _on_arclines_clicked(self):
         """Run line/arc detection on current processing image."""
         if self._proc_state is None or self._proc_state.image_bgr is None:
-            self._status_label.setText("No image — click Grab first")
+            self._status_label.setText("无图像 — 请先点击采集")
             return
-        self._status_label.setText("Running line/arc detection...")
+        self._status_label.setText("正在运行线/弧检测...")
         QApplication.processEvents()
 
         proc_cfg = self._config.get('processing', {})
@@ -1529,7 +1529,7 @@ class MainWindow(QMainWindow):
     def _run_calibration(self, frame: np.ndarray):
         """Launch calibration worker on a grabbed frame."""
         cal_cfg = self._config.get('calibration', {})
-        self._status_label.setText("Running calibration...")
+        self._status_label.setText("正在标定...")
         QApplication.processEvents()
 
         worker = CalibrationWorker(
@@ -1551,10 +1551,10 @@ class MainWindow(QMainWindow):
         self._config['processing']['pixel_size'] = px_size
         self._active_worker = None
         self._status_label.setText(
-            f"Calibrated: {result.pixel_size_mm:.6f} mm/px  "
-            f"(board {result.board_cols}×{result.board_rows}, "
-            f"grid {result.grid_size_mm} mm, "
-            f"mean spacing {result.mean_spacing_px:.2f} px)")
+            f"标定完成: {result.pixel_size_mm:.6f} mm/px  "
+            f"(棋盘格 {result.board_cols}×{result.board_rows}, "
+            f"格子 {result.grid_size_mm} mm, "
+            f"平均间距 {result.mean_spacing_px:.2f} px)")
 
     @Slot(object)
     def _on_arclines_done(self, result: LinesArcsResult):
@@ -1588,14 +1588,14 @@ class MainWindow(QMainWindow):
         n_lines = len(result.lines)
         n_arcs = len(result.arcs)
         self._status_label.setText(
-            f"Detected {n_lines} lines, {n_arcs} arcs")
+            f"检测到 {n_lines} 条直线, {n_arcs} 条曲线")
         self._results_window.reset_redetect_button()
 
     @Slot(str)
     def _on_worker_error(self, msg: str):
         """Handle errors from background workers."""
         self._active_worker = None
-        self._status_label.setText(f"Error: {msg}")
+        self._status_label.setText(f"错误: {msg}")
         self._results_window.reset_redetect_button()
         self._alignment_window.reset_button()
 
@@ -1608,7 +1608,7 @@ class MainWindow(QMainWindow):
         for cfg in self._pair_list_window._all_configs:
             configs[cfg['name']] = cfg['pairs']
         if not configs:
-            self._status_label.setText("No templates saved — create one first")
+            self._status_label.setText("未保存模板 — 请先创建一个")
             return
         self._batch_inspect_window.set_config_names(configs)
         self._batch_inspect_window.show()
@@ -1625,7 +1625,7 @@ class MainWindow(QMainWindow):
         if self._current_mode != "processing":
             self._mode_combo.setCurrentIndex(1)
 
-        self._status_label.setText("Batch inspect: capturing frame...")
+        self._status_label.setText("批量检测: 正在采集帧...")
         self._batch_inspect_pending = True
         self._camera.software_trigger()
 
@@ -1646,7 +1646,7 @@ class MainWindow(QMainWindow):
         template_pairs = self._pair_list_window.get_pairs_for_config(template_name)
         if not template_pairs:
             self._status_label.setText(
-                f"No pairs in template '{template_name}'")
+                f"模板 '{template_name}' 中没有特征对")
             self._batch_inspect_window.reset_button()
             return
 
@@ -1660,14 +1660,14 @@ class MainWindow(QMainWindow):
         alignment_enabled = self._align_batch_check.isChecked()
         if alignment_enabled and not template_features_path:
             self._status_label.setText(
-                f"No template features saved for '{template_name}' — "
-                "re-confirm config to save features")
+                f"模板 '{template_name}' 未保存特征 — "
+                "请重新确认配置以保存特征")
             self._batch_inspect_window.reset_button()
             return
 
         self._status_label.setText(
-            "Running batch inspection..." +
-            (" (with alignment)" if alignment_enabled else ""))
+            "正在运行批量检测..." +
+            (" (含对齐)" if alignment_enabled else ""))
 
         proc_cfg = self._config.get('processing', {})
         det_cfg = self._config.get('detection', {})
@@ -1770,23 +1770,23 @@ class MainWindow(QMainWindow):
                      and not (pair.lower_mm == 0 and pair.upper_mm == 0)
                      and not (pair.lower_mm <= dist <= pair.upper_mm))
         self._status_label.setText(
-            f"Batch inspect done: {n_measured}/{n_total} measured, "
-            f"{n_pass} pass, {n_fail} fail")
+            f"批量检测完成: {n_measured}/{n_total} 已测量, "
+            f"{n_pass} 合格, {n_fail} 不合格")
 
     @Slot(object)
     def _on_batch_alignment_done(self, result: AlignmentResult):
         """Alignment completed during batch inspect — log to status."""
         t = result.transform
         self._status_label.setText(
-            f"Aligned: rot={t.rotation_deg:.2f}°, "
-            f"trans=({t.translation_mm[0]:.2f}, {t.translation_mm[1]:.2f})mm, "
-            f"{result.inlier_count} inliers, RMS={result.residual_rms_mm:.3f}mm")
+            f"已对齐: 旋转={t.rotation_deg:.2f}°, "
+            f"平移=({t.translation_mm[0]:.2f}, {t.translation_mm[1]:.2f})mm, "
+            f"{result.inlier_count} 个内点, RMS={result.residual_rms_mm:.3f}mm")
 
     @Slot(str)
     def _on_batch_inspect_error(self, msg: str):
         """Batch inspection failed."""
         self._active_worker = None
-        self._status_label.setText(f"Batch inspect error: {msg}")
+        self._status_label.setText(f"批量检测错误: {msg}")
         self._batch_inspect_window.reset_button()
 
     @Slot(int)
@@ -1854,32 +1854,32 @@ class MainWindow(QMainWindow):
         has_current = self._last_arclines_result is not None
         if has_template and has_current:
             self._alignment_window.set_status(
-                f"Template: {len(self._template_lines or [])} lines, "
-                f"{len(self._template_arcs or [])} arcs. "
-                f"Current: {len(self._last_arclines_result.lines)} lines, "
-                f"{len(self._last_arclines_result.arcs)} arcs.")
+                f"模板: {len(self._template_lines or [])} 条直线, "
+                f"{len(self._template_arcs or [])} 条曲线。"
+                f"当前: {len(self._last_arclines_result.lines)} 条直线, "
+                f"{len(self._last_arclines_result.arcs)} 条曲线。")
         elif has_template and not has_current:
             self._alignment_window.set_status(
-                "Template features stored. Run Arclines on current frame first.")
+                "已存储模板特征。请先对当前帧运行线弧检测。")
         elif not has_template and has_current:
             self._alignment_window.set_status(
-                "Current features detected. Need template — "
-                "run Arclines once to store template, then Redetect for current.")
+                "已检测当前特征。需要模板 — "
+                "运行一次线弧检测存储模板，再重新检测获取当前帧。")
         else:
             self._alignment_window.set_status(
-                "Need both template and detected features. "
-                "Run Arclines, then Redetect to get a second frame.")
+                "需要模板和检测特征。"
+                "运行线弧检测，再重新检测获取第二帧。")
         self._alignment_window.show()
 
     @Slot()
     def _on_alignment_run(self):
         """Run RANSAC alignment between template and current features."""
         if self._template_lines is None and self._template_arcs is None:
-            self._alignment_window.set_status("No template features stored.")
+            self._alignment_window.set_status("未存储模板特征。")
             self._alignment_window.reset_button()
             return
         if self._last_arclines_result is None:
-            self._alignment_window.set_status("No current detection results.")
+            self._alignment_window.set_status("无当前检测结果。")
             self._alignment_window.reset_button()
             return
 
@@ -1916,7 +1916,7 @@ class MainWindow(QMainWindow):
     def _on_alignment_error(self, msg: str):
         """Alignment failed."""
         self._active_worker = None
-        self._alignment_window.set_status(f"Error: {msg}")
+        self._alignment_window.set_status(f"错误: {msg}")
         self._alignment_window.reset_button()
 
     @Slot(str, str, str, str)
@@ -1930,7 +1930,7 @@ class MainWindow(QMainWindow):
             result.lines, result.arcs, self._processor.pixel_size)
         if dist is None:
             self._status_label.setText(
-                f"Cannot locate features {id_a} / {id_b}")
+                f"无法定位特征 {id_a} / {id_b}")
             return
         pair = FeaturePair(
             type_a=type_a, id_a=id_a,
@@ -1940,7 +1940,7 @@ class MainWindow(QMainWindow):
         self._pair_list_window.add_pair(pair)
         self._pair_list_window.show()
         self._status_label.setText(
-            f"Pair added: {id_a} ↔ {id_b} = {dist:.3f} mm")
+            f"已添加特征对: {id_a} ↔ {id_b} = {dist:.3f} mm")
 
     def _on_pair_config_confirmed(self, configs: list):
         """User confirmed pair configuration — save all configs and template images."""
@@ -1958,7 +1958,7 @@ class MainWindow(QMainWindow):
         # Save/update template image and features for the current config
         if (self._proc_state and self._proc_state.image_bgr is not None
                 and self._pair_list_window._current_index >= 0):
-            cfg_name = self._pair_list_window._name_edit.text().strip() or "unnamed"
+            cfg_name = self._pair_list_window._name_edit.text().strip() or "未命名"
             templates_dir = os.path.join(_app_dir(), 'templates')
             os.makedirs(templates_dir, exist_ok=True)
             safe_name = "".join(c if c.isalnum() or c in ('_', '-') else '_'
@@ -1987,9 +1987,9 @@ class MainWindow(QMainWindow):
                 yaml.dump(self._config, f, default_flow_style=False,
                           sort_keys=False)
             self._status_label.setText(
-                f"Saved {len(configs)} configuration(s)")
+                f"已保存 {len(configs)} 个配置")
         except Exception as e:
-            self._status_label.setText(f"Save failed: {e}")
+            self._status_label.setText(f"保存失败: {e}")
 
     @Slot(int)
     def _on_pair_row_selected(self, row: int):
@@ -2099,7 +2099,7 @@ class MainWindow(QMainWindow):
         self._template_lines = None
         self._template_arcs = None
         self._camera.set_live_mode()
-        self._status_label.setText("Live View")
+        self._status_label.setText("实时预览")
 
     def _switch_to_processing(self):
         """Switch to software trigger mode."""
@@ -2123,11 +2123,11 @@ class MainWindow(QMainWindow):
         if self._last_live_frame is not None:
             self._enter_processing_with_image(self._last_live_frame)
         else:
-            self._status_label.setText("No frame — click Grab to capture")
+            self._status_label.setText("无帧 — 请点击采集")
 
     def _enter_processing_with_image(self, frame: np.ndarray):
         """Set up processing state for a new image."""
-        self._status_label.setText("Running watershed segmentation...")
+        self._status_label.setText("正在运行分水岭分割...")
         QApplication.processEvents()  # update UI before blocking call
 
         # Ensure BGR
@@ -2150,7 +2150,7 @@ class MainWindow(QMainWindow):
 
         n_regions = len([l for l in state.seg.region_sizes if l != 0])
         self._status_label.setText(
-            f"Segmentation done ({n_regions} regions). Click on the FIRST object.")
+            f"分割完成 ({n_regions} 个区域)。点击第一个目标。")
 
     # ── Image click (object picking) ────────────────────────────────
 
@@ -2407,13 +2407,13 @@ def main():
             # Start live view
             camera.set_live_mode()
             window._status_label.setText(
-                f"Connected: {devices[0]['name']} — Live View")
+                f"已连接: {devices[0]['name']} — 实时预览")
         except Exception as e:
             window._status_label.setText(
-                f"Camera open failed: {e}")
+                f"相机打开失败: {e}")
     else:
         window._status_label.setText(
-            "No camera found — connect camera and restart")
+            "未找到相机 — 请连接相机后重启")
 
     window._settings_window.show()
     window._results_window.set_filters_from_config(
